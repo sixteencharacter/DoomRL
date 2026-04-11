@@ -9,6 +9,7 @@ LR = data['LR']
 BATCH_SIZE = data['BATCH_SIZE']
 EPS_START = data['EPS_START']
 EPS_END = data['EPS_END']
+MEMORY_CAP = data['MEMORY_CAP']
 
 EPS_DECAY = data['EPS_DECAY']
 TAU = data['TAU']

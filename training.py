@@ -12,6 +12,8 @@ import logging
 import os
 from datetime import datetime
 
+isDatapointEnough = False
+
 if(not os.path.isdir("logs")) :
     os.mkdir("logs")
 
@@ -26,6 +28,8 @@ def optimize_model() :
     if len(memory) < BATCH_SIZE :
         logging.info("Skipped Optimization due to insufficient data points")
         return
+    global isDatapointEnough
+    isDatapointEnough = True
     logging.info("Optimizing model...")
     transitions = memory.sample(BATCH_SIZE)
     batch = Transition(*zip(*transitions))
@@ -94,7 +98,7 @@ def train(num_episodes) :
 
             if done :
                 logging.info("Episode {} reward: {}".format(i_episodes,cum_reward))
-                if cum_reward >= mx_cum_reward :
+                if isDatapointEnough and cum_reward >= mx_cum_reward :
                     mx_cum_reward = max(cum_reward,mx_cum_reward)
                     save_state_dict(policy_net,optimizer,episode=i_episodes)
                 break
