@@ -13,7 +13,7 @@ import os
 from datetime import datetime
 
 if(not os.path.isdir("logs")) :
-        os.mkdir("logs")
+    os.mkdir("logs")
 
 logging.basicConfig(
     filename='logs/run-{}.log'.format(datetime.now().isoformat()),
@@ -94,9 +94,10 @@ def train(num_episodes) :
             if done :
                 logging.info("Episode {} reward: {}".format(i_episodes,cum_reward))
                 if cum_reward >= mx_cum_reward :
-                    save_state_dict(policy_net,optimizer,"Baseline","v0")
+                    mx_cum_reward = max(cum_reward,mx_cum_reward)
+                    save_state_dict(policy_net,optimizer,episode=i_episodes)
                 break
 
 
 if __name__ == "__main__" : 
-    train(50)
+    train(NUM_EPISODE)

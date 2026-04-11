@@ -26,12 +26,12 @@ def select_action(state,steps) :
 
     return ActionRes(steps,)
 
-def save_state_dict(model,optimizer,mname,version) :
+def save_state_dict(model,optimizer,episode = None) :
 
     if(not os.path.isdir("weights")) :
         os.mkdir("weights")
 
-    logger.info("Save state dict to {}".format(f"weights/{mname}-{version}.pth"))
+    logger.info("Save state dict to {}".format(f"weights/{ARCH}-{VERSION}.pth"))
 
     localModel = deepcopy(model).to("cpu")
     localOptimizer = deepcopy(optimizer)
@@ -39,4 +39,4 @@ def save_state_dict(model,optimizer,mname,version) :
     torch.save({
         'model' : localModel.state_dict(),
         'optimizer' : localOptimizer.state_dict()
-    },f"weights/{mname}-{version}.pth")
+    },f"weights/{ARCH}-{VERSION}{"-{}eps".format(episode) if episode is not None else ""}.pth")
