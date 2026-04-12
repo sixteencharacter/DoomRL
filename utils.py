@@ -6,27 +6,29 @@ from datamodel import ActionRes
 from model import policy_net
 from env import env as GameEnv , device
 import logging
-from icecream import ic
 from copy import deepcopy
 import os
-
+from collections import deque
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-def select_action(state,steps) :
+weights_tracker = deque(maxlen=5)
+
+def select_action(state,steps,inference=False) :
+
     sample = random.random()
     eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1 * steps / EPS_DECAY)
-    steps += 1
-
-    if sample > eps_threshold :
+    logits = None
+    if sample > eps_threshold and not inference :
         with torch.no_grad() :
-            return policy_net(state).max(1).indices.view(1,1)
+            logits = policy_net(state).max(1).indices.view(1,1)
     else :
-        return torch.tensor([[GameEnv.action_space.sample()]],device=device , dtype=torch.long)
+        logits = torch.tensor([[GameEnv.action_space.sample()]],device=device , dtype=torch.long)
 
-    return ActionRes(steps,)
+    return ActionRes(steps,logits)
 
-def save_state_dict(model,optimizer,episode = None) :
+def save_state_dict(model,optimizer,episode = None,persisted = False) :
 
     if(not os.path.isdir("weights")) :
         os.mkdir("weights")
@@ -35,6 +37,14 @@ def save_state_dict(model,optimizer,episode = None) :
 
     localModel = deepcopy(model).to("cpu")
     localOptimizer = deepcopy(optimizer)
+
+    if not persisted :
+        if len(weights_tracker) == weights_tracker.maxlen :
+            old_path = weights_tracker[0]
+            if os.path.exists(old_path) :
+                os.remove(old_path)
+        
+        weights_tracker.append(f"weights/{ARCH}-{VERSION}{"-{}eps".format(episode + CHKPOINT_NUM) if episode is not None else ""}.pth")
 
     torch.save({
         'model' : localModel.state_dict(),

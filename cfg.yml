@@ -1,6 +1,6 @@
 GAMMA: 0.99
 LR: 0.01
-BATCH_SIZE: 1024
+BATCH_SIZE: 40
 EPS_START: 1.0
 EPS_END: 0.1
 EPS_DECAY: 2500
@@ -12,3 +12,6 @@ VERSION: "v0"
 FRAME_SKIP: 4
 PRELOAD_WEIGHT: weights/Baseline-v0-2460eps.pth
 CHKPOINT_NUM: 2461 # last chkpoint num + 1 (if you don't want to lose progress)
+RENDER_MODE: 'human' # null for terminal training
+RESOLUTION : 'RES_160x120'
+SAVING_INTERVAL: 1

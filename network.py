@@ -3,7 +3,6 @@ import torch.nn.functional as F
 import torch
 from env import device , n_actions
 from torchinfo import summary
-from icecream import ic
 
 # Baseline from 1605.02097 (https://arxiv.org/pdf/1605.02097)
 class CNN_DQN(nn.Module) :
@@ -19,7 +18,7 @@ class CNN_DQN(nn.Module) :
     
     def forward(self,x) : 
         B = x.size(0)
-        x = F.interpolate(x,size=(60,45))
+        # x = F.interpolate(x,size=(60,45))
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = self.maxpool(x)

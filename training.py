@@ -18,6 +18,8 @@ from model import policy_net , target_net , optimizer
 from itertools import count
 from utils import select_action , save_state_dict
 from tqdm import tqdm
+from preprocessor import base_preprocessor
+from icecream import ic
 
 import os
 
@@ -26,15 +28,13 @@ isDatapointEnough = False
 if(not os.path.isdir("logs")) :
     os.mkdir("logs")
 
-
-
-def optimize_model() :
+def optimize_model(preprocessor) :
     if len(memory) < BATCH_SIZE :
         logging.info("Skipped Optimization due to insufficient data points")
         return
     global isDatapointEnough
     isDatapointEnough = True
-    transitions = memory.sample(BATCH_SIZE)
+    transitions = memory.sample(BATCH_SIZE,preprocessor)
     batch = Transition(*zip(*transitions))
 
     non_final_mask = torch.tensor(tuple(map(lambda s : s is not None,batch.next_state)),device=device,dtype=torch.bool)
@@ -62,52 +62,67 @@ def optimize_model() :
     optimizer.step()
 
 
-def train(num_episodes) :
+def train(num_episodes,preprocessor) :
 
-    iteration = tqdm(range(num_episodes),total=num_episodes)
-    mx_cum_reward = -1e9
+    try :
 
-    for i_episodes in iteration :
-        cum_reward = 0
-        game_state , info = GameEnv.reset()
-        state = torch.tensor(game_state['screen'] , dtype = torch.float32 , device = device).unsqueeze(0).permute(0,3,1,2)
-        for t in count() :
-            action = select_action(state,t)
-            observation , reward , terminated , truncated , _ = GameEnv.step(action.item())
-            reward = torch.tensor([reward],device=device)
-            done = terminated or truncated
+        iteration = tqdm(range(num_episodes),total=num_episodes)
+        mx_cum_reward = -1e9
 
-            if terminated : 
-                next_state = None
-            else :
-                next_state = torch.tensor(observation['screen'] , dtype = torch.float32 , device = device ).unsqueeze(0).permute(0,3,1,2)
-            
-            memory.push(state , action , next_state , reward)
+        for i_episodes in iteration :
+            cum_reward = 0
+            game_state , info = GameEnv.reset()
+            state = torch.tensor(game_state['screen'] , dtype = torch.float32 , device = device).unsqueeze(0).permute(0,3,1,2)
+            processed_state = preprocessor(state,device=device)
+            for t in count() :
+                action = select_action(processed_state,t)
+                observation , reward , terminated , truncated , _ = GameEnv.step(action.logits.item())
+                reward = torch.tensor([reward],device=device)
+                done = terminated or truncated
 
-            cum_reward += reward.item()
+                if terminated : 
+                    next_state = None
+                else :
+                    next_state = torch.tensor(observation['screen'] , dtype = torch.float32 , device = device ).unsqueeze(0).permute(0,3,1,2)
 
-            iteration.set_description(f"Episode reward: {cum_reward}")
+                memory.push(state , action.logits , next_state , reward)
 
-            state = next_state
+                cum_reward += reward.item()
 
-            optimize_model()
+                iteration.set_description(f"Episode reward: {cum_reward}")
 
-            target_net_state_dict = target_net.state_dict()
-            policy_net_state_dict = policy_net.state_dict()
-            
-            for key in policy_net.state_dict() : 
-                target_net_state_dict[key] = policy_net_state_dict[key] * TAU + target_net_state_dict[key] * (1-TAU)
-            
-            target_net.load_state_dict(target_net_state_dict)
+                state = next_state
+                processed_state = preprocessor(state, device=device)
 
-            if done :
-                logging.info("Episode {} reward: {}".format(i_episodes,cum_reward))
-                if isDatapointEnough and cum_reward >= mx_cum_reward :
-                    mx_cum_reward = max(cum_reward,mx_cum_reward)
-                    save_state_dict(policy_net,optimizer,episode=i_episodes)
-                break
+                optimize_model(preprocessor)
+
+                target_net_state_dict = target_net.state_dict()
+                policy_net_state_dict = policy_net.state_dict()
+                
+                for key in policy_net.state_dict() : 
+                    target_net_state_dict[key] = policy_net_state_dict[key] * TAU + target_net_state_dict[key] * (1-TAU)
+                
+                target_net.load_state_dict(target_net_state_dict)
+
+                if done :
+                    logging.info("Episode {} reward: {}".format(i_episodes,cum_reward))
+                    if isDatapointEnough :
+                        mx_cum_reward = max(cum_reward,mx_cum_reward)
+                        shouldPersist = (cum_reward >= mx_cum_reward)
+                        if(shouldPersist) :
+                            logging.info("Saving weight with persisting = {}".format(shouldPersist))
+                            save_state_dict(policy_net,optimizer,episode=i_episodes,persisted=shouldPersist)
+                        elif i_episodes % SAVING_INTERVAL == 0 :
+                            logging.info("Saving weight with persisting = {} (interval saving)".format(shouldPersist))
+                            save_state_dict(policy_net,optimizer,episode=i_episodes,persisted=False)
+                    break
+    except Exception as e:
+        raise e
+    finally :
+        logging.info("closing preprocessor thread")
+        base_preprocessor.close()
 
 
 if __name__ == "__main__" : 
     logging.info("Running with {}".format(BATCH_SIZE))
-    train(NUM_EPISODE)
+    train(NUM_EPISODE,base_preprocessor)

@@ -18,7 +18,7 @@ from itertools import count
 from utils import select_action , save_state_dict
 from tqdm import tqdm
 import os
-from icecream import ic
+from preprocessor import base_preprocessor
 
 isDatapointEnough = False
 
@@ -31,15 +31,14 @@ def infer() :
 
     cum_reward = 0
     game_state , info = GameEnv.reset()
-    state = torch.tensor(game_state['screen'] , dtype = torch.float32 , device = device).unsqueeze(0).permute(0,3,1,2)
+    state = base_preprocessor(torch.tensor(game_state['screen'] , dtype = torch.float32 , device = device).unsqueeze(0).permute(0,3,1,2))
     for t in count() :
-        action = select_action(state,t)
-        observation , reward , terminated , truncated , _ = GameEnv.step(action.item())
+        action = select_action(state,t,inference=True)
+        observation , reward , terminated , truncated , _ = GameEnv.step(action.logits.item())
         reward = torch.tensor([reward],device=device)
         done = terminated or truncated
 
-
-        next_state = torch.tensor(observation['screen'] , dtype = torch.float32 , device = device ).unsqueeze(0).permute(0,3,1,2)
+        next_state = base_preprocessor(torch.tensor(observation['screen'] , dtype = torch.float32 , device = device ).unsqueeze(0).permute(0,3,1,2))
 
         state = next_state
 
@@ -47,6 +46,8 @@ def infer() :
 
         if done :
             logging.info("reward: {}".format(cum_reward))
+            logging.info("closing preprocessor thread")
+            base_preprocessor.close()
             break
 
 
