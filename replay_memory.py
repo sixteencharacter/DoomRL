@@ -23,7 +23,7 @@ class ReplayMemory:
             next_state_processed = preprocessor([s.next_state for s in samples],device=self.device)
             action = [s.action for s in samples]
             reward = [s.reward for s in samples]
-            return [Transition(state,action,next_state,reward) for state,action,reward,next_state in zip(state_processed,action,reward,next_state_processed)]
+            return [Transition(s,a,n,r) for s,a,n,r in zip(state_processed,action,next_state_processed,reward)]
     
     def __len__(self) :
         return len(self.memory)
