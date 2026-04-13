@@ -15,7 +15,7 @@ class ReplayMemory:
         self.memory.append(Transition(*args))
 
     def sample(self,batch_size,preprocessor=None) :
-        if preprocessor == None :
+        if preprocessor is None :
             return random.sample(self.memory,batch_size)
         else :
             samples : List[Transition]= random.sample(self.memory,batch_size)

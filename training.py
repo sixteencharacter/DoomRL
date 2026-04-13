@@ -134,13 +134,13 @@ def train(num_episodes,preprocessor) :
                         wandb.log({"val_mean_reward": val_mean}, step=training_info.learning_step)
                         policy_net.train()
                         game_state , info = GameEnv.reset()
-                        state = torch.tensor(game_state['screen'] , dtype = torch.float32 , device = device).unsqueeze(0).permute(0,3,1,2)
+                        state = torch.tensor(game_state['screen'] , dtype = torch.float32).unsqueeze(0).permute(0,3,1,2)
                         processed_state = preprocessor(state,device=device)
 
                 if training_info.learning_step % SAVING_INTERVAL == 0 and training_info.learning_step != 0:
                     if isDatapointEnough :
-                        mx_cum_reward = max(cum_reward,mx_cum_reward)
                         shouldPersist = (cum_reward >= mx_cum_reward)
+                        mx_cum_reward = max(cum_reward,mx_cum_reward)
                         if(shouldPersist) :
                             logging.info("Saving weight with persisting = {}".format(shouldPersist))
                             save_state_dict(policy_net,optimizer,steps=training_info.learning_step,persisted=shouldPersist)
