@@ -60,4 +60,4 @@ def save_state_dict(model,optimizer,steps = None,persisted = False) :
     torch.save({
         'model' : localModel.state_dict(),
         'optimizer' : localOptimizer.state_dict()
-    },f"weights/{ARCH}-{VERSION}{"-{}steps".format(steps + CHKPOINT_NUM) if steps is not None else ""}.pth")
+    },f"weights/{ARCH}-{VERSION}-{VARIANT}{"-{}steps".format(steps + CHKPOINT_NUM) if steps is not None else ""}.pth")

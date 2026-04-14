@@ -21,7 +21,7 @@ from tqdm import tqdm
 from preprocessor import base_preprocessor
 from icecream import ic
 from inference import infer
-
+import wandb
 import os
 
 isDatapointEnough = False
@@ -62,6 +62,8 @@ def optimize_model(preprocessor) :
     loss.backward()
     torch.nn.utils.clip_grad_value_(policy_net.parameters(),100)
     optimizer.step()
+
+    wandb.log({"loss": loss.item()}, step=training_info.learning_step)
 
 
 def train(num_episodes,preprocessor) :
@@ -126,17 +128,19 @@ def train(num_episodes,preprocessor) :
                         print("Validation at step {}".format(training_info.learning_step))
                         policy_net.eval()
                         rewards_list = infer(VALIDATION_EPISODES) # testing with 1000 episodes
-                        training_info.eval_mean_rewards.append((training_info.learning_step,sum(rewards_list)/len(rewards_list)))
+                        val_mean = sum(rewards_list)/len(rewards_list)
+                        training_info.eval_mean_rewards.append((training_info.learning_step, val_mean))
                         training_info.to_csv("evaluation.csv")
+                        wandb.log({"val_mean_reward": val_mean}, step=training_info.learning_step)
                         policy_net.train()
                         game_state , info = GameEnv.reset()
-                        state = torch.tensor(game_state['screen'] , dtype = torch.float32 , device = device).unsqueeze(0).permute(0,3,1,2)
+                        state = torch.tensor(game_state['screen'] , dtype = torch.float32).unsqueeze(0).permute(0,3,1,2)
                         processed_state = preprocessor(state,device=device)
 
                 if training_info.learning_step % SAVING_INTERVAL == 0 and training_info.learning_step != 0:
                     if isDatapointEnough :
-                        mx_cum_reward = max(cum_reward,mx_cum_reward)
                         shouldPersist = (cum_reward >= mx_cum_reward)
+                        mx_cum_reward = max(cum_reward,mx_cum_reward)
                         if(shouldPersist) :
                             logging.info("Saving weight with persisting = {}".format(shouldPersist))
                             save_state_dict(policy_net,optimizer,steps=training_info.learning_step,persisted=shouldPersist)
@@ -149,6 +153,7 @@ def train(num_episodes,preprocessor) :
                     break
 
                 if done :
+                    wandb.log({"episode_reward": cum_reward}, step=training_info.learning_step)
                     break
                 
             if training_end :
@@ -158,8 +163,22 @@ def train(num_episodes,preprocessor) :
     finally :
         logging.info("closing preprocessor thread")
         base_preprocessor.close()
+        wandb.finish()
 
 
 if __name__ == "__main__" : 
+    api_key = input("Enter wandb API key: ").strip()
+    wandb.login(key=api_key)
+    wandb.init(
+        project="vizdoom-dqn",
+        name=f"{ARCH}-{VERSION}-{VARIANT}",
+        config={
+            "gamma": GAMMA, "lr": LR, "batch_size": BATCH_SIZE,
+            "eps_start": EPS_START, "eps_end": EPS_END, "eps_decay": EPS_DECAY,
+            "tau": TAU, "memory_cap": MEMORY_CAP, "max_steps": MAX_STEPS,
+            "frame_skip": FRAME_SKIP, "resolution": RESOLUTION,
+        }
+    )
+    wandb.watch(policy_net, log="all", log_freq=100)
     logging.info("Running with {}".format(BATCH_SIZE))
     train(NUM_EPISODE,base_preprocessor)

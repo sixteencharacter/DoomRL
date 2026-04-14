@@ -17,9 +17,11 @@ MAX_STEPS = None if 'MAX_STEPS' not in data else data['MAX_STEPS']
 # naming
 ARCH = data['ARCH']
 VERSION = data['VERSION']
+VARIANT = data["VARIANT"]
 
 # gaming
 FRAME_SKIP = data['FRAME_SKIP']
+SCENARIO_NAME = data['SCENARIO_NAME']
 
 # memory limit
 MEMORY_CAP = data['MEMORY_CAP']

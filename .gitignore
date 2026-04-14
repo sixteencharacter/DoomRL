@@ -3,3 +3,5 @@ weights
 .vscode
 .DS_Store
 __pycache__
+wandb
+*.log
