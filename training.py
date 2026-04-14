@@ -171,7 +171,7 @@ if __name__ == "__main__" :
     wandb.login(key=api_key)
     wandb.init(
         project="vizdoom-dqn",
-        name=f"{ARCH}-{VERSION}",
+        name=f"{ARCH}-{VERSION}-{VARIANT}",
         config={
             "gamma": GAMMA, "lr": LR, "batch_size": BATCH_SIZE,
             "eps_start": EPS_START, "eps_end": EPS_END, "eps_decay": EPS_DECAY,
