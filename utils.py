@@ -6,11 +6,8 @@ from datamodel import ActionRes
 from model import policy_net
 from env import env as GameEnv , device
 import logging
-from copy import deepcopy
 import os
 from collections import deque
-from datetime import datetime
-from icecream import ic
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +24,7 @@ def select_action(state,steps,inference=False) :
             logits = q_value.max(1).indices.view(1,1)
     else :
         sample = random.random()
-        eps_threshold = eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-steps / EPS_DECAY)
+        eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-steps / EPS_DECAY)
         if sample > eps_threshold :
             # ic("exploit")
             with torch.no_grad() :
@@ -43,11 +40,11 @@ def save_state_dict(model,optimizer,steps = None,persisted = False) :
 
     if(not os.path.isdir("weights")) :
         os.mkdir("weights")
-    save_path = f"weights/{ARCH}-{VERSION}-{VARIANT}{"-{}steps".format(steps + CHKPOINT_NUM) if steps is not None else ""}.pth"
-    logger.info("Save state dict to {}".format(save_path))
 
-    localModel = deepcopy(model).to("cpu")
-    localOptimizer = deepcopy(optimizer)
+    logger.info("Save state dict to {}".format(f"weights/{ARCH}-{VERSION}{"-{}eps".format(steps + CHKPOINT_NUM) if steps is not None else ""}.pth"))
+
+    model_state_dict = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+    optimizer_state_dict = optimizer.state_dict()
 
     if not persisted :
         if len(weights_tracker) == weights_tracker.maxlen :
@@ -58,6 +55,6 @@ def save_state_dict(model,optimizer,steps = None,persisted = False) :
         weights_tracker.append(save_path)
 
     torch.save({
-        'model' : localModel.state_dict(),
-        'optimizer' : localOptimizer.state_dict()
+        'model' : model_state_dict,
+        'optimizer' : optimizer_state_dict
     },save_path)
