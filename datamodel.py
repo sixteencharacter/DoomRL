@@ -1,7 +1,8 @@
 import collections
 import dataclasses
 import pandas as pd
-from typing import Tuple , List
+import torch
+from typing import Tuple , List , Optional
 Transition = collections.namedtuple('Transition',('state','action','next_state','reward'))
 
 ActionRes = collections.namedtuple('ActionRes',('step','logits'))
@@ -13,6 +14,13 @@ class TrainingInfo :
 
     def to_csv(self,path) :
         df = pd.DataFrame(self.eval_mean_rewards,columns=['t','mean_reward'])
-        df.to_csv(path) 
+        df.to_csv(path)
 
 training_info = TrainingInfo()
+
+
+@dataclasses.dataclass
+class SampledBatch:
+    transitions: List[Transition]
+    indices: Optional[torch.Tensor]  # None for Uniform; tensor of buffer indices for PER
+    weights: torch.Tensor             # ones for Uniform; IS weights for PER
