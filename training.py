@@ -36,8 +36,9 @@ def optimize_model(preprocessor) :
     global isDatapointEnough
     isDatapointEnough = True
     training_info.learning_step += 1
-    transitions = memory.sample(BATCH_SIZE,preprocessor)
-    batch = Transition(*zip(*transitions))
+    sampled = memory.sample(BATCH_SIZE,preprocessor)
+    batch = Transition(*zip(*sampled.transitions))
+    weights = sampled.weights
 
     non_final_mask = torch.tensor(tuple(map(lambda s : s is not None,batch.next_state)),device=device,dtype=torch.bool)
     non_final_next_states = torch.cat([s for s in batch.next_state if s is not None])
@@ -49,7 +50,7 @@ def optimize_model(preprocessor) :
     state_action_values = policy_net(state_batch).gather(1,action_batch)
 
     next_state_values = torch.zeros(BATCH_SIZE , device=device)
-    
+
     with torch.no_grad() :
         if non_final_next_states.size(0) > 0:
             if METHOD == "DDQN":
@@ -60,15 +61,31 @@ def optimize_model(preprocessor) :
 
     expected_state_action_values = ( next_state_values * GAMMA ) + reward_batch
 
-    criterion = nn.SmoothL1Loss()
-    loss = criterion(state_action_values , expected_state_action_values.unsqueeze(1))
+    criterion = nn.SmoothL1Loss(reduction='none')
+    elementwise_loss = criterion(state_action_values , expected_state_action_values.unsqueeze(1)).squeeze(1)
+    assert elementwise_loss.shape == weights.shape, \
+        f"shape mismatch: loss {elementwise_loss.shape} vs weights {weights.shape}"
+    loss = (weights * elementwise_loss).mean()
 
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_value_(policy_net.parameters(),100)
     optimizer.step()
 
-    wandb.log({"loss": loss.item()}, step=training_info.learning_step)
+    # priority update for PER (no-op for Uniform)
+    td_errors = elementwise_loss.detach()
+    memory.update_priorities(sampled.indices, td_errors)
+
+    log_payload = {"loss": loss.item()}
+    if sampled.indices is not None:
+        log_payload.update({
+            "priority/mean": memory.priority_mean(),
+            "priority/std":  memory.priority_std(),
+            "priority/max":  memory.priority_max(),
+            "is_weight/mean": weights.mean().item(),
+            "is_weight/max":  weights.max().item(),
+        })
+    wandb.log(log_payload, step=training_info.learning_step)
 
 
 def train(num_episodes,preprocessor) :
@@ -176,12 +193,16 @@ if __name__ == "__main__" :
     wandb.login(key=api_key)
     wandb.init(
         project="vizdoom-dqn",
-        name=f"{ARCH}-{VERSION}-{VARIANT}",
+        name=f"{ARCH}-{VERSION}-{VARIANT}-{SAMPLING_METHOD}",
         config={
             "gamma": GAMMA, "lr": LR, "batch_size": BATCH_SIZE,
             "eps_start": EPS_START, "eps_end": EPS_END, "eps_decay": EPS_DECAY,
             "tau": TAU, "memory_cap": MEMORY_CAP, "max_steps": MAX_STEPS,
             "frame_skip": FRAME_SKIP, "resolution": RESOLUTION,
+            "sampling_method": SAMPLING_METHOD,
+            "alpha": ALPHA if SAMPLING_METHOD == "PER" else None,
+            "beta_start": BETA_START if SAMPLING_METHOD == "PER" else None,
+            "beta_end": BETA_END if SAMPLING_METHOD == "PER" else None,
         }
     )
     wandb.watch(policy_net, log="all", log_freq=100)

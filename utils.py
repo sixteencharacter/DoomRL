@@ -43,7 +43,7 @@ def save_state_dict(model,optimizer,steps = None,persisted = False) :
 
     if(not os.path.isdir("weights")) :
         os.mkdir("weights")
-    save_path = f"weights/{ARCH}-{VERSION}-{VARIANT}{"-{}steps".format(steps + CHKPOINT_NUM) if steps is not None else ""}.pth"
+    save_path = f"weights/{ARCH}-{VERSION}-{VARIANT}-{SAMPLING_METHOD}{"-{}steps".format(steps + CHKPOINT_NUM) if steps is not None else ""}.pth"
     logger.info("Save state dict to {}".format(save_path))
 
     localModel = deepcopy(model).to("cpu")

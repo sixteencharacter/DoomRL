@@ -38,3 +38,17 @@ RENDER_MODE = None if 'RENDER_MODE' not in data else data['RENDER_MODE']
 RESOLUTION = data['RESOLUTION']
 
 METHOD = 'DQN' if 'METHOD' not in data else data['METHOD']
+
+# Replay buffer sampling
+SAMPLING_METHOD = data.get('SAMPLING_METHOD', 'Uniform')
+ALPHA = data.get('ALPHA', 0.6)
+BETA_START = data.get('BETA_START', 0.4)
+BETA_END = data.get('BETA_END', 1.0)
+PER_EPSILON = data.get('PER_EPSILON', 1e-6)
+
+if SAMPLING_METHOD == "PER" and MAX_STEPS is None:
+    raise ValueError(
+        "SAMPLING_METHOD='PER' requires MAX_STEPS to be set in cfg.yml "
+        "(beta annealing schedule depends on it). Switch to 'Uniform' "
+        "or set MAX_STEPS for step-mode training."
+    )

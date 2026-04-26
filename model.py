@@ -2,7 +2,7 @@ from network import create_q_network
 from env import n_actions , device
 from torch import optim as O
 from config import *
-from replay_memory import ReplayMemory
+from replay_memory import create_replay_memory
 import logging
 import torch
 
@@ -29,4 +29,4 @@ target_net = create_q_network(
 target_net.load_state_dict(policy_net.state_dict())
 
 optimizer = O.AdamW(policy_net.parameters(),lr=LR,amsgrad=True)
-memory = ReplayMemory(MEMORY_CAP,device)
+memory = create_replay_memory(SAMPLING_METHOD, MEMORY_CAP, device)
