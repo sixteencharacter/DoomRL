@@ -1,53 +1,36 @@
 import torch
-import numpy as np
-from PIL import Image
-from concurrent.futures import ThreadPoolExecutor
-import os
+import torch.nn.functional as F
 
-class NormalPreprocessor :
+class NormalPreprocessor:
+    def __init__(self):
+        pass
 
-    def __init__(self) :
-        self.pool = ThreadPoolExecutor(max_workers=os.cpu_count())
-
-    def _process_individual_frame(self,frame,out_size=(60,45)) :
-
-        if frame is None :
+    def __call__(self, frame, out_size=(112, 112), device=None):
+        if frame is None:
             return None
+        
+        # If frame is a list (for DQN sampling), handle it
+        if isinstance(frame, list):
+            frames = torch.cat(frame, dim=0)
+        else:
+            frames = frame
 
-        frame = frame.detach().cpu()
+        # Ensure we are on the correct device immediately
+        if device is not None:
+            frames = frames.to(device)
 
-        frame = frame.squeeze(0).permute(1,2,0)
+        # Optimization: Perform all operations in a vectorized way on GPU
+        # VizDoom typically provides (B, C, H, W) or (C, H, W)
+        # Normalize to [0, 1]
+        frames = frames.float() / 255.0
 
-        frame = torch.clip(frame,0,255).numpy().astype(np.uint8)
+        # Resize using GPU-accelerated interpolation
+        if frames.shape[-2:] != out_size:
+            frames = F.interpolate(frames, size=out_size, mode='bilinear', align_corners=False)
 
-        # ic(frame)
-
-        img = Image.fromarray(frame).resize(out_size,Image.Resampling.BILINEAR)
-
-        # img.save("processed.png")
-
-        arr = np.asarray(img,dtype = np.float32) / 255.0
-
-        tensor = torch.from_numpy(arr).permute(2,0,1).unsqueeze(0)
-
-        return tensor
-
-    def __call__(self,frame,out_size=(60,45),device=None) :
-
-        if isinstance(frame,list) :
-            processed = self.pool.map(lambda f : self._process_individual_frame(f,out_size),frame)
-            if device is not None :
-                processed = [p if p is None else p.to(device) for p in processed]
-        else :
-            processed = self._process_individual_frame(frame,out_size)
-            if processed is None :
-                return None
-            if device is not None :
-                processed = processed.to(device)
-
-        return processed
+        return frames
     
-    def close(self) :
-        self.pool.shutdown(wait=True)
+    def close(self):
+        pass
 
 base_preprocessor = NormalPreprocessor()

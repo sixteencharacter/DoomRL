@@ -5,7 +5,7 @@ import torch
 from typing import Tuple , List , Optional
 Transition = collections.namedtuple('Transition',('state','action','next_state','reward'))
 
-ActionRes = collections.namedtuple('ActionRes',('step','logits'))
+ActionRes = collections.namedtuple('ActionRes',('step','logits', 'td'), defaults=(None,))
 
 @dataclasses.dataclass
 class TrainingInfo :
