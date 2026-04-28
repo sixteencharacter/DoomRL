@@ -7,6 +7,9 @@ from config import *
 from datamodel import Transition, training_info, StarformerContext, WindowSampledBatch
 from env import device , env as GameEnv
 from model import policy_net , target_net , optimizer, scheduler
+from model import policy_net , target_net , optimizer
+if METHOD == "PPO":
+    from model import loss_module, advantage_module
 from itertools import count
 from utils import select_action , save_state_dict
 from tqdm import tqdm
@@ -15,6 +18,7 @@ from icecream import ic
 from inference import infer
 import wandb
 import os
+from tensordict import TensorDict
 
 
 if(not os.path.isdir("logs")) :
@@ -28,6 +32,7 @@ logging.basicConfig(
 )
 
 isDatapointEnough = False
+ppo_buffer = []
 
 
 def _optimize_starformer():
@@ -115,6 +120,54 @@ def _optimize_starformer():
 
 
 def optimize_model(preprocessor) :
+    global isDatapointEnough
+    if METHOD == "PPO":
+        if len(ppo_buffer) < PPO_BUFFER_SIZE:
+            return False
+        isDatapointEnough = True
+        training_info.learning_step += 1
+        
+        # Stack all TensorDicts in the buffer
+        data = torch.stack(ppo_buffer, dim=0).to(device)
+        ppo_buffer.clear()
+        
+        # MUST set to eval() because GAE uses vmap, which fails with BatchNorm in train mode
+        policy_net.eval()
+        with torch.no_grad():
+            advantage_module(data)
+        policy_net.train()
+        
+        # Advantage Normalization (Crucial for Actor stability)
+        adv = data["advantage"]
+        data["advantage"] = (adv - adv.mean()) / (adv.std() + 1e-8)
+        
+        # PPO Optimization loop
+        for epoch in range(PPO_EPOCHS):
+            # Shuffle and batch
+            indices = torch.randperm(data.shape[0])
+            for i in range(0, data.shape[0], PPO_BATCH_SIZE):
+                batch_indices = indices[i : i + PPO_BATCH_SIZE]
+                batch_data = data[batch_indices]
+                
+                loss_vals = loss_module(batch_data)
+                loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"] + loss_vals["loss_entropy"]
+                
+                optimizer.zero_grad()
+                loss_value.backward()
+                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1.0)
+                optimizer.step()
+        
+        # Clear cache after optimization
+        torch.cuda.empty_cache()
+        
+        wandb.log({
+            "loss/total": loss_value.item(),
+            "loss/objective": loss_vals["loss_objective"].item(),
+            "loss/critic": loss_vals["loss_critic"].item(),
+            "loss/entropy": loss_vals["loss_entropy"].item(),
+        }, step=training_info.learning_step)
+        return True
+
     if len(memory) < BATCH_SIZE :
         logging.info("Skipped Optimization due to insufficient data points")
         return
@@ -124,8 +177,7 @@ def optimize_model(preprocessor) :
         loss_item, did_step = _optimize_starformer()
         if did_step:
             isDatapointEnough = True
-        return
-
+        return False
     isDatapointEnough = True
     training_info.learning_step += 1
     sampled = memory.sample(BATCH_SIZE,preprocessor)
@@ -178,6 +230,7 @@ def optimize_model(preprocessor) :
             "is_weight/max":  weights.max().item(),
         })
     wandb.log(log_payload, step=training_info.learning_step)
+    return True
 
 
 def _compute_episode_rtg(rewards):
@@ -241,16 +294,46 @@ def train(num_episodes,preprocessor) :
 
                 # push transition (with episode_id for STARFORMER; harmless for others)
                 memory.push(state, action.logits, next_state, reward, None, current_episode_id)
+                if METHOD == "PPO":
+                    # For PPO, we need to store the transition in a TensorDict
+                    # action.td already contains observation, logits, action, log_prob
+                    # MUST DETACH to avoid memory leak (keeping the computation graph of the rollout)
+                    current_td = action.td.detach().clone()
+                    
+                    with torch.no_grad():
+                        next_obs = preprocessor(next_state, device=device) if next_state is not None else torch.zeros_like(processed_state)
+                    
+                    current_td.set("next", TensorDict({
+                        "observation": next_obs,
+                        "reward": reward.unsqueeze(0),
+                        "done": torch.tensor([done], device=device, dtype=torch.bool).unsqueeze(0),
+                        "terminated": torch.tensor([terminated], device=device, dtype=torch.bool).unsqueeze(0),
+                    }, batch_size=[1], device=device))
+                    ppo_buffer.append(current_td.squeeze(0))
+                    
+                    # Optimization: Reuse next_obs for the next step's processed_state
+                    state = next_state
+                    processed_state = next_obs
+                else:
+                    memory.push(state , action.logits , next_state , reward)
+                    state = next_state
+                    processed_state = preprocessor(state, device=device)
 
                 cum_reward += reward.item()
 
                 if iteration_mode == "episode" :
                     iteration.set_description(f"Episode reward: {cum_reward}")
 
-                state = next_state
-                processed_state = preprocessor(state, device=device)
+                did_optimize = optimize_model(preprocessor)
 
-                optimize_model(preprocessor)
+                if METHOD != "PPO":
+                    target_net_state_dict = target_net.state_dict()
+                    policy_net_state_dict = policy_net.state_dict()
+                    
+                    for key in policy_net.state_dict() : 
+                        target_net_state_dict[key] = policy_net_state_dict[key] * TAU + target_net_state_dict[key] * (1-TAU)
+                    
+                    target_net.load_state_dict(target_net_state_dict)
 
                 target_net_state_dict = target_net.state_dict()
                 policy_net_state_dict = policy_net.state_dict()
@@ -261,6 +344,7 @@ def train(num_episodes,preprocessor) :
                 target_net.load_state_dict(target_net_state_dict)
 
                 if iteration_mode == "steps" :
+                if did_optimize and iteration_mode == "steps" :
                     # validation
                     if training_info.learning_step % VALIDATION_INTERVAL == 0 and training_info.learning_step != 0:
                         print("Validation at step {}".format(training_info.learning_step))
@@ -282,7 +366,7 @@ def train(num_episodes,preprocessor) :
                             episode_rewards = []
                             cum_reward = 0
 
-                if training_info.learning_step % SAVING_INTERVAL == 0 and training_info.learning_step != 0:
+                if did_optimize and training_info.learning_step % SAVING_INTERVAL == 0 and training_info.learning_step != 0:
                     if isDatapointEnough :
                         shouldPersist = (cum_reward >= mx_cum_reward)
                         mx_cum_reward = max(cum_reward,mx_cum_reward)

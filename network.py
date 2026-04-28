@@ -5,9 +5,10 @@ from torchvision import models
 from env import device , n_actions
 from torchinfo import summary
 from icecream import ic
+from config import *
 
 # Baseline from 1605.02097 (https://arxiv.org/pdf/1605.02097)
-class CNN_DQN(nn.Module) :
+class CNN(nn.Module) :
 
     def __init__(self,n_actions) :
         super().__init__()
@@ -29,7 +30,7 @@ class CNN_DQN(nn.Module) :
         x = self.ff2(x)
         return x
 
-class ResNet_DDQN(nn.Module):
+class ResNet(nn.Module):
 
     def __init__(self, n_actions):
         super().__init__()
@@ -40,7 +41,7 @@ class ResNet_DDQN(nn.Module):
         self.head = nn.Linear(feat_dim, n_actions)
 
     def forward(self, x):
-        x = F.interpolate(x, size=(224, 224))
+        # We now expect x to be pre-resized to 112x112 or similar by the preprocessor
         x = self.backbone(x)
         return self.head(x)
 
@@ -156,10 +157,52 @@ class StarformerQNet(nn.Module):
         x = self.norm(x)
         return self.q_head(x)                                           # (B,K,n_actions)
 
+class ActorCriticResNet(nn.Module):
+    def __init__(self, n_actions):
+        super().__init__()
+        weights = models.ResNet18_Weights.DEFAULT
+        self.backbone = models.resnet18(weights=weights)
+        feat_dim = self.backbone.fc.in_features
+        self.backbone.fc = nn.Identity()
+        
+        self.actor = nn.Linear(feat_dim, n_actions)
+        self.critic = nn.Linear(feat_dim, 1)
+
+    def forward(self, x):
+        x = F.interpolate(x, size=(224, 224))
+        x = self.backbone(x)
+        logits = self.actor(x)
+        value = self.critic(x)
+        return logits, value
+
+class ActorCriticCNN(nn.Module):
+    def __init__(self, n_actions):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 32, 7)
+        self.conv2 = nn.Conv2d(32, 32, 4)
+        self.maxpool = nn.MaxPool2d(2)
+        self.maxpool2 = nn.MaxPool2d(2)
+        self.ff = nn.Linear(3072, 800)
+        
+        self.actor = nn.Linear(800, n_actions)
+        self.critic = nn.Linear(800, 1)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = self.maxpool(x)
+        x = F.relu(self.conv2(x))
+        x = self.maxpool2(x)
+        x = x.flatten(1)
+        x = F.relu(self.ff(x))
+        logits = self.actor(x)
+        value = self.critic(x)
+        return logits, value
 
 def create_q_network(arch, n_actions):
     if arch == "Baseline":
-        return CNN_DQN(n_actions=n_actions)
+        if METHOD == "PPO":
+            return ActorCriticCNN(n_actions=n_actions)
+        return CNN(n_actions=n_actions)
     if arch == "ResNet":
         return ResNet_DDQN(n_actions=n_actions)
     if arch == "STARFORMER":
@@ -180,7 +223,9 @@ def create_q_network(arch, n_actions):
             use_rtg=USE_RTG,
             rtg_scale=STARFORMER_RTG_SCALE,
         )
-    raise ValueError(f"Unsupported ARCH: {arch}")
+    if METHOD == "PPO":
+        return ActorCriticResNet(n_actions=n_actions)
+    return ResNet(n_actions=n_actions)
 
 if __name__ == "__main__" :
     model = None

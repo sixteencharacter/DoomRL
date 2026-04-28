@@ -39,6 +39,15 @@ RESOLUTION = data['RESOLUTION']
 
 METHOD = 'DQN' if 'METHOD' not in data else data['METHOD']
 
+# PPO parameters
+PPO_EPOCHS = data.get('PPO_EPOCHS', 10)
+PPO_CLIP = data.get('PPO_CLIP', 0.2)
+ENTROPY_COEF = data.get('ENTROPY_COEF', 0.01)
+CRITIC_COEF = data.get('CRITIC_COEF', 0.5)
+GAE_LAMBDA = data.get('GAE_LAMBDA', 0.95)
+PPO_BATCH_SIZE = data.get('PPO_BATCH_SIZE', 128)
+PPO_BUFFER_SIZE = data.get('PPO_BUFFER_SIZE', 1024)
+
 # Replay buffer sampling
 SAMPLING_METHOD = data.get('SAMPLING_METHOD', 'Uniform')
 ALPHA = data.get('ALPHA', 0.6)

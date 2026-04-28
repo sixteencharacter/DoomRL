@@ -4,6 +4,7 @@ import pandas as pd
 import torch
 from typing import Tuple, List, Optional, Any, Deque
 
+ActionRes = collections.namedtuple('ActionRes',('step','logits', 'td'), defaults=(None,))
 
 @dataclasses.dataclass
 class Transition:
