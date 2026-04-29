@@ -77,8 +77,21 @@ _min_valid_anchors_raw = data.get('MIN_VALID_ANCHORS', None)
 MIN_VALID_ANCHORS = (4 * BATCH_SIZE) if _min_valid_anchors_raw is None else int(_min_valid_anchors_raw)
 
 # METHOD validation
-if METHOD not in ('DQN', 'DDQN', 'STARFORMER'):
-    raise ValueError(f"Unsupported METHOD={METHOD}; expected DQN | DDQN | STARFORMER")
+if METHOD not in ('DQN', 'DDQN', 'STARFORMER', 'PPO'):
+    raise ValueError(f"Unsupported METHOD={METHOD}; expected DQN | DDQN | STARFORMER | PPO")
+
+if METHOD == 'PPO':
+    if MAX_STEPS is None and NUM_EPISODE is None:
+        raise ValueError(
+            "METHOD=PPO requires either MAX_STEPS or NUM_EPISODE in cfg.yml."
+        )
+    if SAMPLING_METHOD != 'Uniform':
+        import warnings as _warnings
+        _warnings.warn(
+            f"METHOD=PPO with SAMPLING_METHOD={SAMPLING_METHOD!r} is contradictory "
+            "(PPO is on-policy; replay buffer is unused). Forcing SAMPLING_METHOD='Uniform'."
+        )
+        SAMPLING_METHOD = 'Uniform'
 
 if METHOD == 'STARFORMER':
     if MAX_STEPS is None:

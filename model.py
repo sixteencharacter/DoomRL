@@ -8,10 +8,6 @@ from replay_memory import create_replay_memory
 import logging
 import torch
 import torch.nn as nn
-from tensordict.nn import TensorDictModule
-from torchrl.modules import ProbabilisticActor, ValueOperator, OneHotCategorical
-from torchrl.objectives import ClipPPOLoss
-from torchrl.objectives.value import GAE
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +20,76 @@ if PRELOAD_WEIGHT is not None :
     policy_net.load_state_dict(torch.load(PRELOAD_WEIGHT,map_location=torch.device("cpu"))['model'])
     print("model weight loaded from {}".format(PRELOAD_WEIGHT))
     logger.info("model weight loaded from {}".format(PRELOAD_WEIGHT))
-else : 
+else :
     logger.info("model weight loaded from {}".format(PRELOAD_WEIGHT))
     print("No initital weight provided, fall back to random weight")
 
 policy_net = policy_net.to(device)
 
-if METHOD == 'STARFORMER':
+# Defaults — overridden per METHOD below
+target_net = None
+memory = None
+scheduler = None
+loss_module = None
+advantage_module = None
+
+if METHOD == "PPO":
+    from tensordict.nn import TensorDictModule
+    from torchrl.modules import ProbabilisticActor, ValueOperator, OneHotCategorical
+    from torchrl.objectives import ClipPPOLoss
+    from torchrl.objectives.value import GAE
+
+    class _ActorWrapper(nn.Module):
+        def __init__(self, net):
+            super().__init__()
+            self.net = net
+        def forward(self, x):
+            logits, _ = self.net(x)
+            return logits
+
+    class _ValueWrapper(nn.Module):
+        def __init__(self, net):
+            super().__init__()
+            self.net = net
+        def forward(self, x):
+            _, value = self.net(x)
+            return value
+
+    actor_module = TensorDictModule(
+        module=_ActorWrapper(policy_net),
+        in_keys=["observation"],
+        out_keys=["logits"],
+    )
+    actor = ProbabilisticActor(
+        module=actor_module,
+        in_keys=["logits"],
+        out_keys=["action"],
+        distribution_class=OneHotCategorical,
+        return_log_prob=True,
+    )
+
+    value_module = ValueOperator(
+        module=_ValueWrapper(policy_net),
+        in_keys=["observation"],
+    )
+
+    loss_module = ClipPPOLoss(
+        actor=actor,
+        critic=value_module,
+        clip_epsilon=PPO_CLIP,
+        entropy_bonus=True,
+        entropy_coeff=ENTROPY_COEF,
+        critic_coeff=CRITIC_COEF,
+        loss_critic_type="smooth_l1",
+    )
+
+    advantage_module = GAE(
+        gamma=GAMMA, lmbda=GAE_LAMBDA, value_network=value_module, average_gae=True
+    )
+
+    optimizer = O.AdamW(policy_net.parameters(), lr=LR)
+
+elif METHOD == "STARFORMER":
     optimizer = O.AdamW(
         policy_net.parameters(),
         lr=STARFORMER_LR,
@@ -49,69 +108,14 @@ if METHOD == 'STARFORMER':
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = LambdaLR(optimizer, lr_lambda=_starformer_lr_lambda)
-else:
-    optimizer = O.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
-    scheduler = None
 
-memory = create_replay_memory(SAMPLING_METHOD, MEMORY_CAP, device)
-class ActorWrapper(nn.Module):
-    def __init__(self, policy_net):
-        super().__init__()
-        self.policy_net = policy_net
-    def forward(self, x):
-        logits, _ = self.policy_net(x)
-        return logits
-
-class ValueWrapper(nn.Module):
-    def __init__(self, policy_net):
-        super().__init__()
-        self.policy_net = policy_net
-    def forward(self, x):
-        _, value = self.policy_net(x)
-        return value
-
-if METHOD == "PPO":
-    # For PPO, we use the same policy_net but wrapped in torchrl modules
-    actor_module = TensorDictModule(
-        module=ActorWrapper(policy_net),
-        in_keys=["observation"],
-        out_keys=["logits"],
-    )
-    actor = ProbabilisticActor(
-        module=actor_module,
-        in_keys=["logits"],
-        out_keys=["action"],
-        distribution_class=OneHotCategorical,
-        return_log_prob=True,
-    )
-
-    value_module = ValueOperator(
-        module=ValueWrapper(policy_net),
-        in_keys=["observation"],
-    )
-
-    loss_module = ClipPPOLoss(
-        actor=actor,
-        critic=value_module,
-        clip_epsilon=PPO_CLIP,
-        entropy_bonus=True,
-        entropy_coeff=ENTROPY_COEF,
-        critic_coeff=CRITIC_COEF,
-        loss_critic_type="smooth_l1",
-    )
-
-    advantage_module = GAE(
-        gamma=GAMMA, lmbda=GAE_LAMBDA, value_network=value_module, average_gae=True
-    )
-
-    target_net = None # PPO doesn't use target_net in the same way as DQN
-    optimizer = O.AdamW(policy_net.parameters(), lr=LR)
-    memory = None # We'll handle PPO buffer in training.py
-else:
-    target_net = create_q_network(
-        arch=ARCH,
-        n_actions=n_actions
-    ).to(device)
+    target_net = create_q_network(arch=ARCH, n_actions=n_actions).to(device)
     target_net.load_state_dict(policy_net.state_dict())
-    optimizer = O.AdamW(policy_net.parameters(),lr=LR,amsgrad=True)
+    memory = create_replay_memory(SAMPLING_METHOD, MEMORY_CAP, device)
+
+else:
+    # DQN / DDQN
+    optimizer = O.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
+    target_net = create_q_network(arch=ARCH, n_actions=n_actions).to(device)
+    target_net.load_state_dict(policy_net.state_dict())
     memory = create_replay_memory(SAMPLING_METHOD, MEMORY_CAP, device)

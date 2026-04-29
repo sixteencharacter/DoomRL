@@ -2,26 +2,25 @@ import logging
 from datetime import datetime
 import torch
 import torch.nn as nn
-from model import memory
+from torch.distributions import Categorical
 from config import *
 from datamodel import Transition, training_info, StarformerContext, WindowSampledBatch
-from env import device , env as GameEnv
-from model import policy_net , target_net , optimizer, scheduler
-from model import policy_net , target_net , optimizer
-if METHOD == "PPO":
-    from model import loss_module, advantage_module
+from env import device, env as GameEnv
+from model import policy_net, target_net, optimizer, scheduler, memory, loss_module, advantage_module
 from itertools import count
-from utils import select_action , save_state_dict
+from utils import select_action, save_state_dict
 from tqdm import tqdm
 from preprocessor import base_preprocessor
 from icecream import ic
 from inference import infer
 import wandb
 import os
-from tensordict import TensorDict
+
+if METHOD == "PPO":
+    from tensordict import TensorDict
 
 
-if(not os.path.isdir("logs")) :
+if not os.path.isdir("logs"):
     os.mkdir("logs")
 
 logging.basicConfig(
@@ -36,58 +35,50 @@ ppo_buffer = []
 
 
 def _optimize_starformer():
-    """STARFORMER branch: sample K-windows from WindowPrioritizedReplayMemory,
-    forward through transformer, compute TD loss at last sequence position.
-    Returns (loss_item, did_step) or (None, False) if skipped."""
+    """STARFORMER branch: sample K-windows, transformer forward, TD loss at last position.
+    Returns True if step taken, False if skipped."""
     sampled = memory.sample(BATCH_SIZE, base_preprocessor)
     if sampled is None:
-        # gate: not enough valid anchors yet
         wandb.log({"optimize_skipped": 1}, step=training_info.learning_step)
-        return None, False
+        return False
     assert isinstance(sampled, WindowSampledBatch)
     training_info.learning_step += 1
 
-    states_seq = sampled.states_seq                    # (B, K, 3, H, W)
-    actions_seq = sampled.actions_seq                  # (B, K)
-    rtgs_seq = sampled.rtgs_seq                        # (B, K)
-    last_actions = sampled.last_actions                # (B, 1)
-    last_rewards = sampled.last_rewards                # (B,)
-    next_state_last = sampled.next_state_last          # (B, 3, H, W)
-    terminal_mask = sampled.terminal_mask              # (B,)
-    weights = sampled.weights                          # (B,)
-    indices = sampled.indices                          # (B,)
+    states_seq = sampled.states_seq
+    actions_seq = sampled.actions_seq
+    rtgs_seq = sampled.rtgs_seq
+    last_actions = sampled.last_actions
+    last_rewards = sampled.last_rewards
+    next_state_last = sampled.next_state_last
+    terminal_mask = sampled.terminal_mask
+    weights = sampled.weights
+    indices = sampled.indices
 
     B, K = actions_seq.shape
 
-    # Q at anchor (last position)
-    q_seq = policy_net(states_seq, actions_seq, rtgs_seq)              # (B,K,n_actions)
-    state_action_values = q_seq[:, -1, :].gather(1, last_actions).squeeze(1)  # (B,)
+    q_seq = policy_net(states_seq, actions_seq, rtgs_seq)
+    state_action_values = q_seq[:, -1, :].gather(1, last_actions).squeeze(1)
 
-    # Target: roll window forward by one step, replace last with next_state_last.
     next_state_values = torch.zeros(B, device=device)
     with torch.no_grad():
         non_term = ~terminal_mask
         if non_term.any():
-            target_states = torch.cat(
-                [states_seq[:, 1:], next_state_last.unsqueeze(1)], dim=1
-            )                                                            # (B,K,3,H,W)
-            # actions/rtgs for target window: shift forward, last position uses zero placeholder
+            target_states = torch.cat([states_seq[:, 1:], next_state_last.unsqueeze(1)], dim=1)
             target_actions = torch.zeros_like(actions_seq)
             target_actions[:, :-1] = actions_seq[:, 1:]
             target_rtgs = torch.zeros_like(rtgs_seq)
             target_rtgs[:, :-1] = rtgs_seq[:, 1:]
-            target_rtgs[:, -1] = rtgs_seq[:, -1]  # carry last RTG forward
-            # DDQN-style: action from policy_net, value from target_net
+            target_rtgs[:, -1] = rtgs_seq[:, -1]
             policy_q_next = policy_net(target_states, target_actions, target_rtgs)[:, -1, :]
             next_actions = policy_q_next.argmax(1, keepdim=True)
             target_q_next = target_net(target_states, target_actions, target_rtgs)[:, -1, :]
             chosen = target_q_next.gather(1, next_actions).squeeze(1)
             next_state_values = chosen * non_term.float()
 
-    expected_state_action_values = (next_state_values * GAMMA) + last_rewards
+    expected = (next_state_values * GAMMA) + last_rewards
 
     criterion = nn.SmoothL1Loss(reduction='none')
-    elementwise_loss = criterion(state_action_values, expected_state_action_values)
+    elementwise_loss = criterion(state_action_values, expected)
     loss = (weights * elementwise_loss).mean()
 
     optimizer.zero_grad()
@@ -100,7 +91,7 @@ def _optimize_starformer():
     td_errors = elementwise_loss.detach()
     memory.update_priorities(indices, td_errors)
 
-    log_payload = {
+    wandb.log({
         "loss": loss.item(),
         "seq_len": K,
         "rtg_mean": rtgs_seq.mean().item(),
@@ -114,88 +105,104 @@ def _optimize_starformer():
         "is_weight/mean": weights.mean().item(),
         "is_weight/max":  weights.max().item(),
         "lr": optimizer.param_groups[0]['lr'],
-    }
-    wandb.log(log_payload, step=training_info.learning_step)
-    return loss.item(), True
+    }, step=training_info.learning_step)
+    return True
 
 
-def optimize_model(preprocessor) :
-    global isDatapointEnough
-    if METHOD == "PPO":
-        if len(ppo_buffer) < PPO_BUFFER_SIZE:
-            return False
-        isDatapointEnough = True
-        training_info.learning_step += 1
-        
-        # Stack all TensorDicts in the buffer
-        data = torch.stack(ppo_buffer, dim=0).to(device)
-        ppo_buffer.clear()
-        
-        # MUST set to eval() because GAE uses vmap, which fails with BatchNorm in train mode
-        policy_net.eval()
-        with torch.no_grad():
-            advantage_module(data)
-        policy_net.train()
-        
-        # Advantage Normalization (Crucial for Actor stability)
-        adv = data["advantage"]
-        data["advantage"] = (adv - adv.mean()) / (adv.std() + 1e-8)
-        
-        # PPO Optimization loop
-        for epoch in range(PPO_EPOCHS):
-            # Shuffle and batch
-            indices = torch.randperm(data.shape[0])
-            for i in range(0, data.shape[0], PPO_BATCH_SIZE):
-                batch_indices = indices[i : i + PPO_BATCH_SIZE]
-                batch_data = data[batch_indices]
-                
-                loss_vals = loss_module(batch_data)
-                loss_value = loss_vals["loss_objective"] + loss_vals["loss_critic"] + loss_vals["loss_entropy"]
-                
-                optimizer.zero_grad()
-                loss_value.backward()
-                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1.0)
-                optimizer.step()
-        
-        # Clear cache after optimization
+def _optimize_ppo():
+    """PPO branch: when ppo_buffer is full, run K epochs of minibatch updates.
+    Returns True if a step was taken."""
+    if len(ppo_buffer) < PPO_BUFFER_SIZE:
+        return False
+    training_info.learning_step += 1
+
+    data = torch.stack(ppo_buffer, dim=0).to(device)
+    ppo_buffer.clear()
+
+    policy_net.eval()
+    with torch.no_grad():
+        advantage_module(data)
+    policy_net.train()
+
+    adv = data["advantage"]
+    data["advantage"] = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+    last_loss_total = 0.0
+    last_loss_obj = 0.0
+    last_loss_critic = 0.0
+    last_loss_entropy = 0.0
+    for _epoch in range(PPO_EPOCHS):
+        perm = torch.randperm(data.shape[0])
+        for i in range(0, data.shape[0], PPO_BATCH_SIZE):
+            batch_indices = perm[i:i + PPO_BATCH_SIZE]
+            batch_data = data[batch_indices]
+            loss_vals = loss_module(batch_data)
+            loss_value = (
+                loss_vals["loss_objective"]
+                + loss_vals["loss_critic"]
+                + loss_vals["loss_entropy"]
+            )
+            optimizer.zero_grad()
+            loss_value.backward()
+            torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1.0)
+            optimizer.step()
+            last_loss_total = loss_value.item()
+            last_loss_obj = loss_vals["loss_objective"].item()
+            last_loss_critic = loss_vals["loss_critic"].item()
+            last_loss_entropy = loss_vals["loss_entropy"].item()
+
+    if device.type == 'cuda':
         torch.cuda.empty_cache()
-        
-        wandb.log({
-            "loss/total": loss_value.item(),
-            "loss/objective": loss_vals["loss_objective"].item(),
-            "loss/critic": loss_vals["loss_critic"].item(),
-            "loss/entropy": loss_vals["loss_entropy"].item(),
-        }, step=training_info.learning_step)
-        return True
 
-    if len(memory) < BATCH_SIZE :
-        logging.info("Skipped Optimization due to insufficient data points")
-        return
+    wandb.log({
+        "loss/total": last_loss_total,
+        "loss/objective": last_loss_obj,
+        "loss/critic": last_loss_critic,
+        "loss/entropy": last_loss_entropy,
+    }, step=training_info.learning_step)
+    return True
+
+
+def optimize_model(preprocessor):
+    """Returns True iff a gradient step occurred this call."""
     global isDatapointEnough
+
+    if METHOD == "PPO":
+        stepped = _optimize_ppo()
+        if stepped:
+            isDatapointEnough = True
+        return stepped
+
+    if memory is None or len(memory) < BATCH_SIZE:
+        logging.info("Skipped Optimization due to insufficient data points")
+        return False
 
     if METHOD == 'STARFORMER':
-        loss_item, did_step = _optimize_starformer()
-        if did_step:
+        stepped = _optimize_starformer()
+        if stepped:
             isDatapointEnough = True
-        return False
+        return stepped
+
     isDatapointEnough = True
     training_info.learning_step += 1
-    sampled = memory.sample(BATCH_SIZE,preprocessor)
+    sampled = memory.sample(BATCH_SIZE, preprocessor)
     batch = Transition(*zip(*sampled.transitions))
     weights = sampled.weights
 
-    non_final_mask = torch.tensor(tuple(map(lambda s : s is not None,batch.next_state)),device=device,dtype=torch.bool)
+    non_final_mask = torch.tensor(
+        tuple(s is not None for s in batch.next_state),
+        device=device, dtype=torch.bool,
+    )
     non_final_next_states = torch.cat([s for s in batch.next_state if s is not None])
 
     state_batch = torch.cat(batch.state)
     action_batch = torch.cat(batch.action)
     reward_batch = torch.cat(batch.reward)
 
-    state_action_values = policy_net(state_batch).gather(1,action_batch)
+    state_action_values = policy_net(state_batch).gather(1, action_batch)
 
-    next_state_values = torch.zeros(BATCH_SIZE , device=device)
-
-    with torch.no_grad() :
+    next_state_values = torch.zeros(BATCH_SIZE, device=device)
+    with torch.no_grad():
         if non_final_next_states.size(0) > 0:
             if METHOD == "DDQN":
                 next_actions = policy_net(non_final_next_states).argmax(1, keepdim=True)
@@ -203,20 +210,18 @@ def optimize_model(preprocessor) :
             else:
                 next_state_values[non_final_mask] = target_net(non_final_next_states).max(1).values
 
-    expected_state_action_values = ( next_state_values * GAMMA ) + reward_batch
+    expected = (next_state_values * GAMMA) + reward_batch
 
     criterion = nn.SmoothL1Loss(reduction='none')
-    elementwise_loss = criterion(state_action_values , expected_state_action_values.unsqueeze(1)).squeeze(1)
-    assert elementwise_loss.shape == weights.shape, \
-        f"shape mismatch: loss {elementwise_loss.shape} vs weights {weights.shape}"
+    elementwise_loss = criterion(state_action_values, expected.unsqueeze(1)).squeeze(1)
+    assert elementwise_loss.shape == weights.shape
     loss = (weights * elementwise_loss).mean()
 
     optimizer.zero_grad()
     loss.backward()
-    torch.nn.utils.clip_grad_value_(policy_net.parameters(),100)
+    torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
     optimizer.step()
 
-    # priority update for PER (no-op for Uniform)
     td_errors = elementwise_loss.detach()
     memory.update_priorities(sampled.indices, td_errors)
 
@@ -234,7 +239,7 @@ def optimize_model(preprocessor) :
 
 
 def _compute_episode_rtg(rewards):
-    """Discounted return-to-go for one episode: g_t = sum_{u>=t} gamma^{u-t} r_u."""
+    """Discounted return-to-go: g_t = sum_{u>=t} gamma^{u-t} r_u."""
     rtgs = [0.0] * len(rewards)
     running = 0.0
     for t in reversed(range(len(rewards))):
@@ -243,29 +248,53 @@ def _compute_episode_rtg(rewards):
     return rtgs
 
 
-def train(num_episodes,preprocessor) :
+def _ppo_select_action(processed_state):
+    """For PPO: sample action via Categorical(logits) on policy_net actor head.
+    Returns (action_int, logits, value, log_prob)."""
+    logits, value = policy_net(processed_state)
+    dist = Categorical(logits=logits)
+    action = dist.sample()
+    log_prob = dist.log_prob(action)
+    return action, logits, value, log_prob
 
-    try :
 
+def _ppo_collect(processed_state, next_processed_state, action, logits, value, log_prob, reward, terminated, done):
+    """Build a single-step TensorDict and push into ppo_buffer."""
+    n_act = logits.shape[-1]
+    action_one_hot = torch.zeros((1, n_act), device=device)
+    action_one_hot[0, int(action.item())] = 1.0
+    td = TensorDict({
+        "observation": processed_state.detach(),
+        "logits": logits.detach(),
+        "action": action_one_hot,
+        "sample_log_prob": log_prob.detach().view(1),
+        "next": TensorDict({
+            "observation": next_processed_state.detach(),
+            "reward": reward.view(1, 1),
+            "done": torch.tensor([[done]], device=device, dtype=torch.bool),
+            "terminated": torch.tensor([[terminated]], device=device, dtype=torch.bool),
+        }, batch_size=[1], device=device),
+    }, batch_size=[1], device=device)
+    ppo_buffer.append(td.squeeze(0))
+
+
+def train(num_episodes, preprocessor):
+    try:
         iteration_mode = "episode" if NUM_EPISODE is not None else "steps"
-
         logging.info(f"Using iteration mode of {iteration_mode}")
 
         total_iteration = NUM_EPISODE if NUM_EPISODE is not None else MAX_STEPS
-
-        iteration = tqdm(range(total_iteration),total=total_iteration)
+        iteration = tqdm(range(total_iteration), total=total_iteration)
 
         training_end = False
-
         mx_cum_reward = -1e9
-
         episode_id_counter = 0
 
-        for i_episodes in count() :
+        for i_episodes in count():
             cum_reward = 0
-            game_state , info = GameEnv.reset()
-            state = torch.tensor(game_state['screen'].copy() , dtype = torch.float32).unsqueeze(0).permute(0,3,1,2)
-            processed_state = preprocessor(state,device=device)
+            game_state, _info = GameEnv.reset()
+            state = torch.tensor(game_state['screen'].copy(), dtype=torch.float32).unsqueeze(0).permute(0, 3, 1, 2)
+            processed_state = preprocessor(state, device=device)
 
             current_episode_id = episode_id_counter
             episode_id_counter += 1
@@ -275,90 +304,73 @@ def train(num_episodes,preprocessor) :
             if METHOD == 'STARFORMER':
                 ctx = StarformerContext(K=STARFORMER_K, rtg_target=STARFORMER_RTG_TARGET)
 
-            for t in count() :
-                action = select_action(processed_state,training_info.learning_step,ctx=ctx)
-                observation , reward , terminated , truncated , _ = GameEnv.step(action.logits.item())
-                if iteration_mode == "steps" :
+            for _t in count():
+                # Action selection
+                if METHOD == "PPO":
+                    action_t, logits_t, value_t, log_prob_t = _ppo_select_action(processed_state)
+                    action_int = int(action_t.item())
+                else:
+                    action = select_action(processed_state, training_info.learning_step, ctx=ctx)
+                    action_int = int(action.logits.item())
+
+                observation, reward, terminated, truncated, _ = GameEnv.step(action_int)
+                if iteration_mode == "steps":
                     iteration.n = training_info.learning_step
                     iteration.refresh()
                     iteration.set_description(f"Step Reward {reward}")
-                reward_scalar = float(reward)
-                episode_rewards.append(reward_scalar)
-                reward = torch.tensor([reward],device=device)
+
+                episode_rewards.append(float(reward))
+                reward_t = torch.tensor([reward], device=device, dtype=torch.float32)
                 done = terminated or truncated
 
-                if terminated :
+                if terminated:
                     next_state = None
-                else :
-                    next_state = torch.tensor(observation['screen'].copy() , dtype = torch.float32).unsqueeze(0).permute(0,3,1,2)
-
-                # push transition (with episode_id for STARFORMER; harmless for others)
-                memory.push(state, action.logits, next_state, reward, None, current_episode_id)
-                if METHOD == "PPO":
-                    # For PPO, we need to store the transition in a TensorDict
-                    # action.td already contains observation, logits, action, log_prob
-                    # MUST DETACH to avoid memory leak (keeping the computation graph of the rollout)
-                    current_td = action.td.detach().clone()
-                    
-                    with torch.no_grad():
-                        next_obs = preprocessor(next_state, device=device) if next_state is not None else torch.zeros_like(processed_state)
-                    
-                    current_td.set("next", TensorDict({
-                        "observation": next_obs,
-                        "reward": reward.unsqueeze(0),
-                        "done": torch.tensor([done], device=device, dtype=torch.bool).unsqueeze(0),
-                        "terminated": torch.tensor([terminated], device=device, dtype=torch.bool).unsqueeze(0),
-                    }, batch_size=[1], device=device))
-                    ppo_buffer.append(current_td.squeeze(0))
-                    
-                    # Optimization: Reuse next_obs for the next step's processed_state
-                    state = next_state
-                    processed_state = next_obs
+                    next_processed_state = torch.zeros_like(processed_state)
                 else:
-                    memory.push(state , action.logits , next_state , reward)
-                    state = next_state
-                    processed_state = preprocessor(state, device=device)
+                    next_state = torch.tensor(observation['screen'].copy(), dtype=torch.float32).unsqueeze(0).permute(0, 3, 1, 2)
+                    next_processed_state = preprocessor(next_state, device=device)
 
-                cum_reward += reward.item()
+                # Buffer push
+                if METHOD == "PPO":
+                    _ppo_collect(
+                        processed_state, next_processed_state,
+                        action_t, logits_t, value_t, log_prob_t,
+                        reward_t, terminated, done,
+                    )
+                else:
+                    memory.push(state, action.logits, next_state, reward_t, None, current_episode_id)
 
-                if iteration_mode == "episode" :
+                cum_reward += float(reward)
+                if iteration_mode == "episode":
                     iteration.set_description(f"Episode reward: {cum_reward}")
+
+                state = next_state
+                processed_state = next_processed_state if next_state is not None else processed_state
 
                 did_optimize = optimize_model(preprocessor)
 
-                if METHOD != "PPO":
-                    target_net_state_dict = target_net.state_dict()
-                    policy_net_state_dict = policy_net.state_dict()
-                    
-                    for key in policy_net.state_dict() : 
-                        target_net_state_dict[key] = policy_net_state_dict[key] * TAU + target_net_state_dict[key] * (1-TAU)
-                    
-                    target_net.load_state_dict(target_net_state_dict)
+                # Soft target update — DQN/DDQN/STARFORMER only
+                if METHOD != "PPO" and target_net is not None:
+                    target_state = target_net.state_dict()
+                    policy_state = policy_net.state_dict()
+                    for key in policy_state:
+                        target_state[key] = policy_state[key] * TAU + target_state[key] * (1 - TAU)
+                    target_net.load_state_dict(target_state)
 
-                target_net_state_dict = target_net.state_dict()
-                policy_net_state_dict = policy_net.state_dict()
-
-                for key in policy_net.state_dict() :
-                    target_net_state_dict[key] = policy_net_state_dict[key] * TAU + target_net_state_dict[key] * (1-TAU)
-
-                target_net.load_state_dict(target_net_state_dict)
-
-                if iteration_mode == "steps" :
-                if did_optimize and iteration_mode == "steps" :
-                    # validation
+                # Validation
+                if did_optimize and iteration_mode == "steps":
                     if training_info.learning_step % VALIDATION_INTERVAL == 0 and training_info.learning_step != 0:
-                        print("Validation at step {}".format(training_info.learning_step))
+                        print(f"Validation at step {training_info.learning_step}")
                         policy_net.eval()
-                        rewards_list = infer(VALIDATION_EPISODES) # testing with 1000 episodes
-                        val_mean = sum(rewards_list)/len(rewards_list)
+                        rewards_list = infer(VALIDATION_EPISODES)
+                        val_mean = sum(rewards_list) / len(rewards_list)
                         training_info.eval_mean_rewards.append((training_info.learning_step, val_mean))
                         training_info.to_csv("evaluation.csv")
                         wandb.log({"val_mean_reward": val_mean}, step=training_info.learning_step)
                         policy_net.train()
-                        game_state , info = GameEnv.reset()
-                        state = torch.tensor(game_state['screen'] , dtype = torch.float32).unsqueeze(0).permute(0,3,1,2)
-                        processed_state = preprocessor(state,device=device)
-                        # validation re-entered the env — start a fresh logical episode
+                        game_state, _info = GameEnv.reset()
+                        state = torch.tensor(game_state['screen'], dtype=torch.float32).unsqueeze(0).permute(0, 3, 1, 2)
+                        processed_state = preprocessor(state, device=device)
                         if METHOD == 'STARFORMER':
                             ctx = StarformerContext(K=STARFORMER_K, rtg_target=STARFORMER_RTG_TARGET)
                             current_episode_id = episode_id_counter
@@ -366,45 +378,44 @@ def train(num_episodes,preprocessor) :
                             episode_rewards = []
                             cum_reward = 0
 
+                # Saving
                 if did_optimize and training_info.learning_step % SAVING_INTERVAL == 0 and training_info.learning_step != 0:
-                    if isDatapointEnough :
-                        shouldPersist = (cum_reward >= mx_cum_reward)
-                        mx_cum_reward = max(cum_reward,mx_cum_reward)
-                        if(shouldPersist) :
-                            logging.info("Saving weight with persisting = {}".format(shouldPersist))
-                            save_state_dict(policy_net,optimizer,steps=training_info.learning_step,persisted=shouldPersist)
-                        elif training_info.learning_step % SAVING_INTERVAL == 0 :
-                            logging.info("Saving weight with persisting = {} (interval saving)".format(shouldPersist))
-                            save_state_dict(policy_net,optimizer,steps=training_info.learning_step,persisted=False)
+                    if isDatapointEnough:
+                        should_persist = (cum_reward >= mx_cum_reward)
+                        mx_cum_reward = max(cum_reward, mx_cum_reward)
+                        if should_persist:
+                            logging.info(f"Saving weight with persisting = {should_persist}")
+                            save_state_dict(policy_net, optimizer, steps=training_info.learning_step, persisted=should_persist)
+                        else:
+                            logging.info(f"Saving weight with persisting = {should_persist} (interval saving)")
+                            save_state_dict(policy_net, optimizer, steps=training_info.learning_step, persisted=False)
 
-                if (iteration_mode == "steps" and (training_info.learning_step >= MAX_STEPS - 1)) or (iteration_mode == "episode" and (i_episodes >= NUM_EPISODE - 1)) :
+                if (iteration_mode == "steps" and training_info.learning_step >= MAX_STEPS - 1) or \
+                   (iteration_mode == "episode" and i_episodes >= NUM_EPISODE - 1):
                     training_end = True
                     break
 
-                if done :
-                    # backfill RTG for STARFORMER — must be done before next sample sees None
+                if done:
                     if METHOD == 'STARFORMER' and hasattr(memory, 'backfill_rtg'):
                         rtgs = _compute_episode_rtg(episode_rewards)
                         memory.backfill_rtg(current_episode_id, rtgs)
                     wandb.log({"episode_reward": cum_reward}, step=training_info.learning_step)
                     break
 
-            if training_end :
+            if training_end:
                 break
-    except Exception as e:
-        raise e
-    finally :
+    finally:
         logging.info("closing preprocessor thread")
         base_preprocessor.close()
         wandb.finish()
 
 
-if __name__ == "__main__" :
+if __name__ == "__main__":
     api_key = input("Enter wandb API key: ").strip()
     wandb.login(key=api_key)
     wandb.init(
         project="vizdoom-dqn",
-        name=f"{ARCH}-{VERSION}-{VARIANT}-{SAMPLING_METHOD}",
+        name=f"{ARCH}-{VERSION}-{VARIANT}-{METHOD}-{SAMPLING_METHOD}",
         config={
             "gamma": GAMMA, "lr": LR, "batch_size": BATCH_SIZE,
             "eps_start": EPS_START, "eps_end": EPS_END, "eps_decay": EPS_DECAY,
@@ -421,8 +432,11 @@ if __name__ == "__main__" :
             "starformer_dim": STARFORMER_DIM if METHOD == 'STARFORMER' else None,
             "starformer_lr": STARFORMER_LR if METHOD == 'STARFORMER' else None,
             "use_rtg": USE_RTG if METHOD == 'STARFORMER' else None,
+            "ppo_epochs": PPO_EPOCHS if METHOD == 'PPO' else None,
+            "ppo_clip": PPO_CLIP if METHOD == 'PPO' else None,
+            "ppo_buffer_size": PPO_BUFFER_SIZE if METHOD == 'PPO' else None,
         }
     )
     wandb.watch(policy_net, log="all", log_freq=100)
-    logging.info("Running with {}".format(BATCH_SIZE))
-    train(NUM_EPISODE,base_preprocessor)
+    logging.info(f"Running with batch_size={BATCH_SIZE} method={METHOD}")
+    train(NUM_EPISODE, base_preprocessor)

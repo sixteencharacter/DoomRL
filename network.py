@@ -204,7 +204,9 @@ def create_q_network(arch, n_actions):
             return ActorCriticCNN(n_actions=n_actions)
         return CNN(n_actions=n_actions)
     if arch == "ResNet":
-        return ResNet_DDQN(n_actions=n_actions)
+        if METHOD == "PPO":
+            return ActorCriticResNet(n_actions=n_actions)
+        return ResNet(n_actions=n_actions)
     if arch == "STARFORMER":
         from config import (
             STARFORMER_K,
@@ -223,9 +225,7 @@ def create_q_network(arch, n_actions):
             use_rtg=USE_RTG,
             rtg_scale=STARFORMER_RTG_SCALE,
         )
-    if METHOD == "PPO":
-        return ActorCriticResNet(n_actions=n_actions)
-    return ResNet(n_actions=n_actions)
+    raise ValueError(f"Unsupported ARCH: {arch}")
 
 if __name__ == "__main__" :
     model = None
