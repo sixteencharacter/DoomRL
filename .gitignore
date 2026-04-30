@@ -13,3 +13,4 @@ dataset/maze
 scenarios
 skills
 _vizdoom.init
+*.zip

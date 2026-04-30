@@ -57,7 +57,7 @@ def load_demo_npy(scene_path: str, action_path: str,preprocessor) -> list[Tensor
 
         td = TensorDict(
             {
-                "observation":    preprocessor(obs_t,device=device),
+                "observation":    preprocessor(obs_t),
                 "expert_action":  act_t,
             },
             batch_size=[1],
@@ -162,8 +162,8 @@ def optimize_model(preprocessor, scene_path: str, action_path: str) -> bool:
 
                 if demo_batch is not None and "expert_action" in demo_batch.keys():
                     il_present  = True
-                    demo_obs    = demo_batch["observation"]            # already preprocessed
-                    targets     = demo_batch["expert_action"].view(-1).long()
+                    demo_obs    = demo_batch["observation"].to(device)
+                    targets     = demo_batch["expert_action"].view(-1).long().to(device)
 
                     # fix #5: stay in train() mode; never flip to eval mid-loop
                     logits = policy_net(demo_obs)
