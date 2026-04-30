@@ -37,17 +37,18 @@ logging.basicConfig(
 )
 
 
-def sample_il_batch():
+def sample_il_batch(batch_size: int = 32):
 
-    # Load raw numpy arrays from the human demonstration dataset
-    obs = np.load("dataset/maze/human_states.npy")      # shape: (N, H, W, C)
-    actions = np.load("dataset/maze/human_actions.npy")  # shape: (N,)
+    # Use mmap_mode to avoid loading the full dataset into RAM
+    obs = np.load("dataset/maze/human_states.npy", mmap_mode="r")      # shape: (N, H, W, C)
+    actions = np.load("dataset/maze/human_actions.npy", mmap_mode="r")  # shape: (N,)
 
-    # Convert to float tensors and move to the training device
-    obs_t = torch.tensor(obs, dtype=torch.float32).permute(0, 3, 1, 2).to(device)  # (N, C, H, W)
-    actions_t = torch.tensor(actions, dtype=torch.long).to(device)                  # (N,)
+    indices = np.random.choice(len(obs), size=batch_size, replace=False)
 
-    batch_size = obs_t.shape[0]
+    # Copy only the sampled rows off the memory-mapped file
+    obs_t = torch.tensor(obs[indices].copy(), dtype=torch.float32).permute(0, 3, 1, 2).to(device)  # (B, C, H, W)
+    actions_t = torch.tensor(actions[indices].copy(), dtype=torch.long).to(device)                  # (B,)
+
     return TensorDict(
         {"observation": obs_t, "action": actions_t},
         batch_size=[batch_size],
@@ -118,7 +119,7 @@ def optimize_model(
     adv = data["advantage"]
     data["advantage"] = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-    il_batch = sample_il_batch()
+    il_batch = sample_il_batch(batch_size=cfg.ppo_batch_size)
     il_obs = preprocessor(il_batch["observation"], device=device)
     il_actions = il_batch["action"]
 
@@ -166,13 +167,13 @@ def optimize_model(
 
 
 def train(
-        ppo_buffer_size=8,
+        ppo_buffer_size=16,
         ppo_epochs=1,
-        ppo_batch_size=2,
+        ppo_batch_size=4,
         validation_interval=5000,
         max_steps=600000,
         saving_interval=5000,
-        m=4,
+        m=2,
         use_wandb=False
     ):
 
