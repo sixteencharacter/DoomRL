@@ -40,14 +40,20 @@ logging.basicConfig(
 def sample_il_batch(batch_size: int = 32):
 
     # Use mmap_mode to avoid loading the full dataset into RAM
-    obs = np.load("dataset/maze/human_states.npy", mmap_mode="r")      # shape: (N, H, W, C)
+    obs = np.load("dataset/maze/human_states.npy", mmap_mode="r")      # shape: (N, C, H, W)
     actions = np.load("dataset/maze/human_actions.npy", mmap_mode="r")  # shape: (N,)
 
     indices = np.random.choice(len(obs), size=batch_size, replace=False)
 
     # Copy only the sampled rows off the memory-mapped file
-    obs_t = torch.tensor(obs[indices].copy(), dtype=torch.float32).permute(0, 3, 1, 2).to(device)  # (B, C, H, W)
-    actions_t = torch.tensor(actions[indices].copy(), dtype=torch.long).to(device)                  # (B,)
+    # VizDoom screen_buffer is already (C, H, W), so dataset is (N, C, H, W) — no permute needed
+    obs_t = torch.tensor(obs[indices].copy(), dtype=torch.float32).to(device)  # (B, C, H, W)
+    # VizDoom get_last_action() returns a binary button vector per step, so the dataset
+    # may be (N, num_buttons). Convert to scalar action indices via argmax.
+    actions_raw = actions[indices].copy()
+    if actions_raw.ndim == 2:
+        actions_raw = actions_raw.argmax(axis=1)
+    actions_t = torch.tensor(actions_raw, dtype=torch.long).to(device)                  # (B,)
 
     return TensorDict(
         {"observation": obs_t, "action": actions_t},
