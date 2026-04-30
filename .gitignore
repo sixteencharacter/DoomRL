@@ -12,5 +12,6 @@ GEMINI.md
 dataset/maze
 scenarios
 skills
-_vizdoom.init
+_vizdoom.ini
 *.zip
+.amazonq

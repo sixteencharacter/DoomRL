@@ -1,7 +1,8 @@
 from datamodel import training_info
 import torch
-import torch.nn.functional as F 
+import torch.nn.functional as F
 import numpy as np
+import random
 from env import device
 from model import policy_net, advantage_module, loss_module, optimizer
 from itertools import count
@@ -10,119 +11,105 @@ from utils import select_action, save_state_dict
 from tqdm import tqdm
 from tensordict import TensorDict
 from preprocessor import base_preprocessor
+import fire
+import wandb
+import logging
+import os
+from datetime import datetime
+from typing import List, TypedDict
+from collections import namedtuple
+from config import *
+from inference import infer
 
-# ── Hyper-parameters ──────────────────────────────────────────────────────────
-PPO_BUFFER_SIZE      = 32
-PPO_EPOCHS           = 4
-PPO_BATCH_SIZE       = 8
-VALIDATION_INTERVAL  = 5000
-MAX_STEPS            = 600_000
-SAVING_INTERVAL      = 5000
+TrainingConfig = namedtuple('TrainingConfig',(
+    'ppo_buffer_size','ppo_epochs','ppo_batch_size',
+    'validation_interval','max_steps','saving_interval','m','use_wandb'
+))
 
-# IN-RIL ratio controls ────────────────────────────────────────────────────────
-#   IL_BATCH_RATIO  – how many IL samples per RL sample  (e.g. 0.5 → half as many)
-#   IL_WEIGHT       – gradient blending weight for the IL gradient
-#   RL_WEIGHT       – gradient blending weight for the RL gradient
-IL_BATCH_RATIO  = 0.5          # replaces RL2IL_RATIO
-IL_WEIGHT       = 0.5
-RL_WEIGHT       = 1.0 - IL_WEIGHT
+if not os.path.isdir("logs"):
+    os.mkdir("logs")
 
-ppo_buffer: list = []
-
-# ── Demo-buffer utilities ─────────────────────────────────────────────────────
-
-def load_demo_npy(scene_path: str, action_path: str,preprocessor) -> list[TensorDict]:
-    """
-    Load ground-truth demonstrations from two .npy files.
-
-    scene_path  – shape (N, H, W, C)  uint8 / float32 frames
-    action_path – shape (N,)           int64 / int32  discrete actions
-
-    Returns a list of TensorDicts ready to stack into a demo buffer.
-    """
-    scenes  = np.load(scene_path)                           # (N, H, W, C)
-    actions = np.load(action_path)                          # (N,)
-
-    assert len(scenes) == len(actions), \
-        f"Scene/action length mismatch: {len(scenes)} vs {len(actions)}"
-
-    demos = []
-    for obs, act in zip(scenes, actions):
-        obs_t = (
-            torch.tensor(obs, dtype=torch.float32)
-            .unsqueeze(0)           # (1, H, W, C)
-            .permute(0, 3, 1, 2)   # (1, C, H, W)
-        )
-        act_t = torch.tensor([act], dtype=torch.long)       # (1,)
-
-        td = TensorDict(
-            {
-                "observation":    preprocessor(obs_t),
-                "expert_action":  act_t,
-            },
-            batch_size=[1],
-        )
-        demos.append(td.squeeze(0))
-
-    return demos
-
-def _sample_buffer(buffer: list[TensorDict], batch_size: int):
-    """Return a stacked TensorDict batch, or None if buffer is empty."""
-    if batch_size <= 0 or len(buffer) == 0:
-        return None
-    batch_size = min(batch_size, len(buffer))
-    idx = torch.randperm(len(buffer))[:batch_size].tolist()
-    return torch.stack([buffer[i] for i in idx], dim=0).to(device)
+logging.basicConfig(
+    filename='logs/run-{}.log'.format(datetime.now().isoformat()),
+    level=logging.INFO,
+    format='%(asctime)s - [%(name)s] - %(levelname)s - %(message)s',
+    filemode="a"
+)
 
 
-# ── Gradient surgery (fixed) ──────────────────────────────────────────────────
+def sample_il_batch():
 
-def _gradient_surgery(
-    grads_rl: tuple,
-    grads_il: tuple,
-    params:   list,
-) -> tuple[list, list]:
-    """
-    Project conflicting gradients so they do not point in opposing directions.
-    """
-    proj_rl, proj_il = [], []
+    # Load raw numpy arrays from the human demonstration dataset
+    obs = np.load("dataset/maze/human_states.npy")      # shape: (N, H, W, C)
+    actions = np.load("dataset/maze/human_actions.npy")  # shape: (N,)
 
-    for p, g_r, g_i in zip(params, grads_rl, grads_il):
-        g_r = torch.zeros_like(p) if g_r is None else g_r.detach()
-        g_i = torch.zeros_like(p) if g_i is None else g_i.detach()
+    # Convert to float tensors and move to the training device
+    obs_t = torch.tensor(obs, dtype=torch.float32).permute(0, 3, 1, 2).to(device)  # (N, C, H, W)
+    actions_t = torch.tensor(actions, dtype=torch.long).to(device)                  # (N,)
 
-        dot = torch.dot(g_r.flatten(), g_i.flatten())
-
-        if dot < 0:
-            g_r_proj = g_r - (dot / (g_i.flatten().pow(2).sum() + 1e-12)) * g_i
-            g_i_proj = g_i - (dot / (g_r.flatten().pow(2).sum() + 1e-12)) * g_r
-        else:
-            g_r_proj, g_i_proj = g_r, g_i
-
-        proj_rl.append(g_r_proj)
-        proj_il.append(g_i_proj)
-
-    return proj_rl, proj_il
+    batch_size = obs_t.shape[0]
+    return TensorDict(
+        {"observation": obs_t, "action": actions_t},
+        batch_size=[batch_size],
+        device=device
+    )
 
 
-# ── Core optimisation step ────────────────────────────────────────────────────
+def do_gradient_surgery(base_parameters, il_gradient, rl_gradients):
+    # PCGrad algorithm (Yu et al., 2020).
+    #
+    # rl_gradients : List[List[Tensor]]  -- one gradient list per RL mini-batch step (m total)
+    # il_gradient  : List[Tensor]        -- one gradient list from the single IL update
+    #
+    # All m+1 gradient vectors are treated as independent tasks.
+    # For each task i, iterate over every other task j in a random order;
+    # if g_i conflicts with g_j (dot < 0), project g_i onto the plane
+    # orthogonal to g_j:  g_i <- g_i - (g_i.g_j / ||g_j||^2) * g_j
+    # param.grad is set to the sum of all m+1 processed gradients.
 
-def optimize_model(preprocessor, scene_path: str, action_path: str) -> bool:
-    """
-    Run one IN-RIL optimisation step.
+    # Build the flat list of all tasks: m RL gradients + 1 IL gradient
+    all_gradients = rl_gradients + [il_gradient]  # List[List[Tensor]], length m+1
+    n_tasks = len(all_gradients)
 
-    IL interleaving is controlled by IL_BATCH_RATIO:
-      il_batch_size = max(1, round(PPO_BATCH_SIZE * IL_BATCH_RATIO))
-    Set IL_BATCH_RATIO = 0 to disable IL entirely.
-    """
-    if len(ppo_buffer) < PPO_BUFFER_SIZE:
-        return False
+    processed = []
+    for i in range(n_tasks):
+        other_indices = list(range(n_tasks))
+        other_indices.remove(i)
+        random.shuffle(other_indices)  # random projection order per PCGrad
 
-    training_info.learning_step += 1
+        grads_i = [g.clone() if g is not None else None for g in all_gradients[i]]
+
+        for j in other_indices:
+            grads_j = all_gradients[j]
+            for k, (g_i, g_j) in enumerate(zip(grads_i, grads_j)):
+                if g_i is None or g_j is None:
+                    continue
+                # dot product and projection are per-parameter (not global)
+                g_i_flat, g_j_flat = g_i.flatten(), g_j.flatten()
+                dot = torch.dot(g_i_flat, g_j_flat)
+                if dot < 0:
+                    norm_sq = torch.dot(g_j_flat, g_j_flat).clamp(min=1e-12)
+                    grads_i[k] = g_i - (dot / norm_sq) * g_j
+
+        processed.append(grads_i)
+
+    # Sum all processed task gradients and write into param.grad
+    params = list(base_parameters)
+    for k, param in enumerate(params):
+        grads_k = [processed[i][k] for i in range(n_tasks) if processed[i][k] is not None]
+        param.grad = torch.stack(grads_k).sum(dim=0).reshape(param.shape) if grads_k else None
+
+
+def optimize_model(
+        preprocessor,
+        ppo_buffer: List[TensorDict],
+        cfg: TrainingConfig,
+    ):
+
     data = torch.stack(ppo_buffer, dim=0).to(device)
+    data["observation"] = preprocessor(data["observation"])
     ppo_buffer.clear()
 
-    # ── Advantage estimation ──────────────────────────────────────────────────
     policy_net.eval()
     with torch.no_grad():
         advantage_module(data)
@@ -131,186 +118,183 @@ def optimize_model(preprocessor, scene_path: str, action_path: str) -> bool:
     adv = data["advantage"]
     data["advantage"] = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-    # ── Compute IL batch size once (fix #4: must be int) ─────────────────────
-    il_batch_size = max(1, round(PPO_BATCH_SIZE * IL_BATCH_RATIO)) if IL_BATCH_RATIO > 0 else 0
+    il_batch = sample_il_batch()
+    il_obs = preprocessor(il_batch["observation"], device=device)
+    il_actions = il_batch["action"]
 
-    # ── PPO epochs ───────────────────────────────────────────────────────────
-    for _epoch in range(PPO_EPOCHS):
-        indices = torch.randperm(data.shape[0], device=device)
+    for _ in range(cfg.ppo_epochs):
+        indices = torch.randperm(data.shape[0])
+        rl_grads_accumulator = []  # collects one gradient list per RL mini-batch (up to m)
 
-        for i in range(0, data.shape[0], PPO_BATCH_SIZE):
-            batch_indices = indices[i : i + PPO_BATCH_SIZE]
-            rl_batch = data[batch_indices]
+        for i in range(0, data.shape[0], cfg.ppo_batch_size):
+            batch_indices = indices[i: i + cfg.ppo_batch_size]
+            batch_data = data[batch_indices]
 
-            # ── RL loss ───────────────────────────────────────────────────────
-            loss_vals = loss_module(rl_batch)
-            loss_rl = (
-                loss_vals["loss_objective"]
-                + loss_vals["loss_critic"]
-                + loss_vals["loss_entropy"]
+            # --- RL (PPO) gradient for this mini-batch ---
+            loss_vals = loss_module(batch_data)
+            rl_loss = loss_vals["loss_objective"] + loss_vals["loss_critic"] + loss_vals["loss_entropy"]
+
+            rl_grads_accumulator.append(
+                list(torch.autograd.grad(rl_loss, policy_net.parameters(), allow_unused=True))
             )
 
-            # ── IL loss ───────────────────────────────────────────────────────
-            loss_il    = torch.tensor(0.0, device=device)
-            il_present = False
+            # Every m RL steps, perform one IL update via gradient surgery
+            if len(rl_grads_accumulator) >= cfg.m:
+                # --- IL (behavioural cloning) gradient ---
+                logits, _ = policy_net(il_obs)
+                il_loss = F.cross_entropy(logits, il_actions)
+                il_grads = list(torch.autograd.grad(il_loss, policy_net.parameters(), allow_unused=True))
 
-            if il_batch_size > 0:
-                demo_buffer = load_demo_npy(
-                    scene_path, action_path, preprocessor
-                )
-                demo_batch = _sample_buffer(demo_buffer, il_batch_size)
-
-                if demo_batch is not None and "expert_action" in demo_batch.keys():
-                    il_present  = True
-                    demo_obs    = demo_batch["observation"].to(device)
-                    targets     = demo_batch["expert_action"].view(-1).long().to(device)
-
-                    # fix #5: stay in train() mode; never flip to eval mid-loop
-                    logits = policy_net(demo_obs)
-                    n_actions = logits.shape[-1]
-                    loss_il = F.cross_entropy(logits.view(-1, n_actions), targets)
-
-            # ── Gradient update ───────────────────────────────────────────────
-            params = [p for p in policy_net.parameters() if p.requires_grad]
-
-            if not il_present:
+                # --- Gradient surgery: m RL gradients + 1 IL gradient ---
                 optimizer.zero_grad()
-                loss_rl.backward()
+                do_gradient_surgery(policy_net.parameters(), il_grads, rl_grads_accumulator)
                 torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1.0)
                 optimizer.step()
-                continue
+                rl_grads_accumulator = []  # reset for the next m-step window
 
-            grads_rl = torch.autograd.grad(
-                loss_rl, params, retain_graph=True, allow_unused=True
-            )
-            grads_il = torch.autograd.grad(
-                loss_il, params, allow_unused=True   # no need to retain after this
-            )
-
-            proj_rl, proj_il = _gradient_surgery(grads_rl, grads_il, params)
-
-            optimizer.zero_grad()
-            for p, g_r, g_i in zip(params, proj_rl, proj_il):
-                p.grad = RL_WEIGHT * g_r + IL_WEIGHT * g_i
-
-            torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1.0)
-            optimizer.step()
-
+    training_info.learning_step += 1
     torch.cuda.empty_cache()
-    return True
+
+    if cfg.use_wandb:
+        wandb.log({
+            "loss/rl_total": rl_loss.item(),
+            "loss/objective": loss_vals["loss_objective"].item(),
+            "loss/critic": loss_vals["loss_critic"].item(),
+            "loss/entropy": loss_vals["loss_entropy"].item(),
+            "loss/il_bc": il_loss.item(),
+        }, step=training_info.learning_step)
 
 
-# ── Training loop ─────────────────────────────────────────────────────────────
+def train(
+        ppo_buffer_size=8,
+        ppo_epochs=1,
+        ppo_batch_size=2,
+        validation_interval=5000,
+        max_steps=600000,
+        saving_interval=5000,
+        m=4,
+        use_wandb=False
+    ):
 
-def train(preprocessor, total_iteration, scene_path: str, action_path: str):
-
-    mx_cum_reward  = float("-inf")  
-    training_end   = False         
-
-    iteration = tqdm(range(total_iteration), total=total_iteration)
-
-    for _episode in count():
-        cum_reward = 0
-        game_state, _info = GameEnv.reset()
-        state = (
-            torch.tensor(game_state["screen"].copy(), dtype=torch.float32)
-            .unsqueeze(0)
-            .permute(0, 3, 1, 2)
-        )
-        processed_state = preprocessor(state, device=device)
-
-        for _t in count():
-            action = select_action(processed_state, training_info.learning_step)
-
-            observation, reward, terminated, truncated, _ = GameEnv.step(
-                action.logits.item()
-            )
-
-            iteration.n = training_info.learning_step
-            iteration.refresh()
-            iteration.set_description(f"Step Reward {reward}")
-
-            reward = torch.tensor([reward], device=device)
-            done   = terminated or truncated
-
-            next_state = (
-                None
-                if terminated
-                else torch.tensor(
-                    observation["screen"].copy(), dtype=torch.float32
-                )
-                .unsqueeze(0)
-                .permute(0, 3, 1, 2)
-            )
-
-            current_td = action.td.detach().clone()
-
-            with torch.no_grad():
-                next_obs = (
-                    preprocessor(next_state, device=device)
-                    if next_state is not None
-                    else torch.zeros_like(processed_state)
-                )
-
-            current_td.set(
-                "next",
-                TensorDict(
-                    {
-                        "observation": next_obs,
-                        "reward":      reward.unsqueeze(0),
-                        "done":        torch.tensor([done],       device=device, dtype=torch.bool).unsqueeze(0),
-                        "terminated":  torch.tensor([terminated], device=device, dtype=torch.bool).unsqueeze(0),
-                    },
-                    batch_size=[1],
-                    device=device,
-                ),
-            )
-            ppo_buffer.append(current_td.squeeze(0))
-
-            processed_state = next_obs
-            cum_reward      += reward.item()
-
-            did_optimize = optimize_model(preprocessor, scene_path, action_path)
-
-            if did_optimize:
-                step = training_info.learning_step
-
-                if step % VALIDATION_INTERVAL == 0 and step != 0:
-                    print(f"Validation at step {step}")
-                    policy_net.eval()
-                    training_info.to_csv("evaluation.csv")
-                    policy_net.train()
-                    game_state, _ = GameEnv.reset()
-                    state = (
-                        torch.tensor(game_state["screen"], dtype=torch.float32)
-                        .unsqueeze(0)
-                        .permute(0, 3, 1, 2)
-                    )
-                    processed_state = preprocessor(state, device=device)
-
-                if step % SAVING_INTERVAL == 0 and step != 0:
-                    should_persist  = cum_reward >= mx_cum_reward
-                    mx_cum_reward   = max(cum_reward, mx_cum_reward)
-                    save_state_dict(
-                        policy_net,
-                        optimizer,
-                        steps=step,
-                        persisted=should_persist,
-                    )
-
-                if step >= MAX_STEPS - 1:
-                    training_end = True
-
-            if training_end or done:
-                break
-
-        if training_end:
-            break
-
-if __name__ == "__main__" :
-    train(
-        base_preprocessor,
-        MAX_STEPS,
-        "dataset/maze/human_states.npy",
-        "dataset/maze/human_actions.npy"
+    cfg = TrainingConfig(
+        ppo_buffer_size=ppo_buffer_size,
+        ppo_epochs=ppo_epochs,
+        ppo_batch_size=ppo_batch_size,
+        validation_interval=validation_interval,
+        max_steps=max_steps,
+        saving_interval=saving_interval,
+        m=m,
+        use_wandb=use_wandb
     )
+
+    n_minibatches = cfg.ppo_buffer_size // cfg.ppo_batch_size
+    assert n_minibatches >= cfg.m, (
+        f"Insufficient mini-batches per optimize_model call to trigger IL: "
+        f"ppo_buffer_size ({cfg.ppo_buffer_size}) // ppo_batch_size ({cfg.ppo_batch_size}) "
+        f"= {n_minibatches} mini-batches, but m={cfg.m} RL steps are required before each IL update. "
+        f"Increase ppo_buffer_size or decrease ppo_batch_size / m."
+    )
+
+    ppo_buffer = []
+    mx_cum_reward = -1e9
+
+    if cfg.use_wandb:
+        api_key = input("Enter wandb API key: ").strip()
+        wandb.login(key=api_key)
+        wandb.init(
+            project="vizdoom-inril",
+            name=f"{ARCH}-{VERSION}-{VARIANT}-inril",
+            config={
+                "gamma": GAMMA, "lr": LR,
+                "ppo_clip": PPO_CLIP, "gae_lambda": GAE_LAMBDA,
+                "entropy_coef": ENTROPY_COEF, "critic_coef": CRITIC_COEF,
+            }
+        )
+        wandb.watch(policy_net, log="all", log_freq=100)
+
+    try:
+        progress = tqdm(total=cfg.max_steps)
+
+        for i_episode in count():
+            cum_reward = 0
+            game_state, _ = GameEnv.reset()
+            state = torch.tensor(
+                game_state['screen'].copy(), dtype=torch.float32
+            ).unsqueeze(0).permute(0, 3, 1, 2)
+            processed_state = base_preprocessor(state, device=device)
+
+            for t in count():
+                action = select_action(processed_state, training_info.learning_step)
+                observation, reward, terminated, truncated, _ = GameEnv.step(action.logits.item())
+                done = terminated or truncated
+                reward_t = torch.tensor([reward], device=device)
+
+                # Build next observation
+                if terminated:
+                    next_obs = torch.zeros_like(processed_state)
+                else:
+                    next_state_raw = torch.tensor(
+                        observation['screen'].copy(), dtype=torch.float32
+                    ).unsqueeze(0).permute(0, 3, 1, 2)
+                    next_obs = base_preprocessor(next_state_raw, device=device)
+
+                # Store transition in PPO buffer as TensorDict
+                # MUST DETACH to avoid keeping the rollout computation graph
+                current_td = action.td.detach().clone()
+                current_td.set("next", TensorDict({
+                    "observation": next_obs,
+                    "reward": reward_t.unsqueeze(0),
+                    "done": torch.tensor([done], device=device, dtype=torch.bool).unsqueeze(0),
+                    "terminated": torch.tensor([terminated], device=device, dtype=torch.bool).unsqueeze(0),
+                }, batch_size=[1], device=device))
+                ppo_buffer.append(current_td.squeeze(0))
+
+                processed_state = next_obs
+                cum_reward += reward
+
+                # Run PPO + IL (gradient surgery) optimisation when buffer is full
+                if len(ppo_buffer) >= cfg.ppo_buffer_size:
+                    optimize_model(base_preprocessor, ppo_buffer, cfg)
+                    progress.n = training_info.learning_step
+                    progress.set_description(f"step={training_info.learning_step} reward={cum_reward:.1f}")
+                    progress.refresh()
+
+                    # Validation
+                    if training_info.learning_step % cfg.validation_interval == 0 and training_info.learning_step > 0:
+                        policy_net.eval()
+                        rewards_list = infer(VALIDATION_EPISODES)
+                        val_mean = sum(rewards_list) / len(rewards_list)
+                        training_info.eval_mean_rewards.append((training_info.learning_step, val_mean))
+                        training_info.to_csv("evaluation.csv")
+                        if cfg.use_wandb:
+                            wandb.log({"val_mean_reward": val_mean}, step=training_info.learning_step)
+                        policy_net.train()
+
+                    # Checkpoint saving
+                    if training_info.learning_step % cfg.saving_interval == 0 and training_info.learning_step > 0:
+                        should_persist = cum_reward >= mx_cum_reward
+                        mx_cum_reward = max(cum_reward, mx_cum_reward)
+                        save_state_dict(
+                            policy_net, optimizer,
+                            steps=training_info.learning_step,
+                            persisted=should_persist
+                        )
+
+                    if training_info.learning_step >= cfg.max_steps:
+                        return
+
+                if done:
+                    if cfg.use_wandb:
+                        wandb.log({"episode_reward": cum_reward}, step=training_info.learning_step)
+                    break
+
+    except Exception as e:
+        raise e
+    finally:
+        base_preprocessor.close()
+        if cfg.use_wandb:
+            wandb.finish()
+
+
+if __name__ == "__main__":
+    fire.Fire(train)
