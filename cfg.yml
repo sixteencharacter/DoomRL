@@ -1,39 +1,65 @@
+# ─── General ───────────────────────────────────────────────────────────────────
+ARCH: ResNet          # ResNet | Baseline | STARFORMER
+METHOD: DQN           # DQN | DDQN | STARFORMER  (ignored when USE_PPO=true)
+USE_PPO: true         # toggle PPO objective for any ARCH
+VERSION: v0
+VARIANT: basic
+
+# ─── Environment ───────────────────────────────────────────────────────────────
+SCENARIO_NAME: VizdoomBasic-v1
+RESOLUTION: RES_160x120
+FRAME_SKIP: 4
+RENDER_MODE: null
+
+# ─── Training ──────────────────────────────────────────────────────────────────
 GAMMA: 0.99
 LR: 0.0001
 BATCH_SIZE: 40
+MAX_STEPS: 600000
+NUM_EPISODE: null
+
 EPS_START: 1.0
 EPS_END: 0.1
 EPS_DECAY: 10000
 TAU: 0.005
-NUM_EPISODE: null
+
+# ─── Memory / Replay ───────────────────────────────────────────────────────────
 MEMORY_CAP: 10000
-ARCH: "ResNet"
-VERSION: "v0"
-FRAME_SKIP: 4
-PRELOAD_WEIGHT: null # path to pretrained weight (if any)
-CHKPOINT_NUM: 1 # last chkpoint num + 1 (if you don't want to lose progress)
-RENDER_MODE: null # null for terminal training and 'human' for rendering
-RESOLUTION : 'RES_160x120'
-SAVING_INTERVAL: 5000
-VALIDATION_INTERVAL : 5000
-VALIDATION_EPISODES : 1000
-MAX_STEPS: 600000
-SCENARIO_NAME : "VizdoomBasic-v1"
-VARIANT : "basic"
-
-METHOD: "PPO" # DQN | DDQN | PPO
-
-# PPO parameters
-PPO_EPOCHS: 4 # number of epochs to update the policy
-PPO_CLIP: 0.2 # clip parameter for PPO
-ENTROPY_COEF: 0.01 # coefficient for entropy bonus
-CRITIC_COEF: 0.5  # coefficient for critic loss
-GAE_LAMBDA: 0.95 # lambda for Generalized Advantage Estimation
-PPO_BATCH_SIZE: 16 # batch size for PPO updates 
-PPO_BUFFER_SIZE: 128 # number of transitions to collect before updating the policy
-
-SAMPLING_METHOD: "PER" # Uniform | PER
+SAMPLING_METHOD: PER   # Uniform | PER | WindowPER  (auto-forced Uniform when USE_PPO=true)
 ALPHA: 0.6
 BETA_START: 0.4
 BETA_END: 1.0
-PER_EPSILON: 0.000001
+PER_EPSILON: 1.0e-06
+
+# ─── Checkpointing ─────────────────────────────────────────────────────────────
+PRELOAD_WEIGHT: null
+CHKPOINT_NUM: 1
+SAVING_INTERVAL: 5000
+
+# ─── Validation ────────────────────────────────────────────────────────────────
+VALIDATION_INTERVAL: 5000
+VALIDATION_EPISODES: 1000
+
+# ─── PPO  (active when USE_PPO=true) ───────────────────────────────────────────
+PPO_BUFFER_SIZE: 1024
+PPO_BATCH_SIZE: 64
+PPO_EPOCHS: 4
+PPO_CLIP: 0.2
+GAE_LAMBDA: 0.95
+ENTROPY_COEF: 0.01
+CRITIC_COEF: 0.5
+PPO_USE_AMP: true
+PPO_COMPILE: false    # opt-in torch.compile — may conflict with TorchRL graph tracing
+
+# ─── STARFORMER  (active when ARCH=STARFORMER) ─────────────────────────────────
+STARFORMER_K: 30                 # window length
+STARFORMER_LAYERS: 6
+STARFORMER_HEADS: 8
+STARFORMER_DIM: 192
+STARFORMER_LR: 0.0006
+STARFORMER_WARMUP_STEPS: 4000
+STARFORMER_RTG_TARGET: 80.0
+STARFORMER_RTG_SCALE: 1.0
+STARFORMER_USE_EPSILON: true
+USE_RTG: true
+MIN_VALID_ANCHORS: null          # null → auto (4 × BATCH_SIZE)

@@ -7,6 +7,7 @@ from env import device , env as GameEnv
 from itertools import count
 from utils import select_action
 from model import policy_net
+from datamodel import StarformerContext
 from tqdm import tqdm
 import os
 from preprocessor import base_preprocessor
@@ -36,8 +37,13 @@ def infer(n_episodes) :
             cum_reward = 0
             game_state , info = GameEnv.reset()
             state = base_preprocessor(torch.tensor(game_state['screen'].copy() , dtype = torch.float32).unsqueeze(0).permute(0,3,1,2),device=device)
+
+            ctx = None
+            if METHOD == 'STARFORMER':
+                ctx = StarformerContext(K=STARFORMER_K, rtg_target=STARFORMER_RTG_TARGET)
+
             for t in count() :
-                action = select_action(state.to(device),t,inference=True)
+                action = select_action(state.to(device),t,ctx=ctx,inference=True)
                 action_id = action.logits.item()
                 action_hist[action_id] += 1
                 observation , reward , terminated , truncated , _ = GameEnv.step(action_id)
