@@ -15,7 +15,7 @@ import fire
 import wandb
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, TypedDict
 from collections import namedtuple
 from config import *
@@ -30,7 +30,7 @@ if not os.path.isdir("logs"):
     os.mkdir("logs")
 
 logging.basicConfig(
-    filename='logs/run-{}.log'.format(datetime.now().isoformat()),
+    filename='logs/run-{}.log'.format(datetime.now(tz=timezone.utc).isoformat()),
     level=logging.INFO,
     format='%(asctime)s - [%(name)s] - %(levelname)s - %(message)s',
     filemode="a"
