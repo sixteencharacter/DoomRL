@@ -176,13 +176,13 @@ def optimize_model(
 
 
 def train(
-        ppo_buffer_size=16,
-        ppo_epochs=1,
-        ppo_batch_size=4,
+        ppo_buffer_size=128,
+        ppo_epochs=4,
+        ppo_batch_size=16,
         validation_interval=5000,
         max_steps=600000,
         saving_interval=5000,
-        m=2,
+        m=5,
         use_wandb=False
     ):
 
