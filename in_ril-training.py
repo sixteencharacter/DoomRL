@@ -39,21 +39,24 @@ logging.basicConfig(
 
 def sample_il_batch(batch_size: int = 32):
 
-    # Use mmap_mode to avoid loading the full dataset into RAM
-    obs = np.load("dataset/maze/human_states.npy", mmap_mode="r")      # shape: (N, C, H, W)
-    actions = np.load("dataset/maze/human_actions.npy", mmap_mode="r")  # shape: (N,)
+    # Use mmap_mode to avoid loading the full dataset into RAM.
+    # del the mmap handles in finally to ensure the file descriptors are always released.
+    obs_mmap = np.load("dataset/maze/human_states.npy", mmap_mode="r")      # shape: (N, C, H, W)
+    actions_mmap = np.load("dataset/maze/human_actions.npy", mmap_mode="r")  # shape: (N,) or (N, num_buttons)
+    try:
+        indices = np.random.choice(len(obs_mmap), size=batch_size, replace=False)
 
-    indices = np.random.choice(len(obs), size=batch_size, replace=False)
+        # VizDoom screen_buffer is already (C, H, W), so dataset is (N, C, H, W) - no permute needed
+        obs_t = torch.tensor(obs_mmap[indices].copy(), dtype=torch.float32).to(device)  # (B, C, H, W)
 
-    # Copy only the sampled rows off the memory-mapped file
-    # VizDoom screen_buffer is already (C, H, W), so dataset is (N, C, H, W) — no permute needed
-    obs_t = torch.tensor(obs[indices].copy(), dtype=torch.float32).to(device)  # (B, C, H, W)
-    # VizDoom get_last_action() returns a binary button vector per step, so the dataset
-    # may be (N, num_buttons). Convert to scalar action indices via argmax.
-    actions_raw = actions[indices].copy()
-    if actions_raw.ndim == 2:
-        actions_raw = actions_raw.argmax(axis=1)
-    actions_t = torch.tensor(actions_raw, dtype=torch.long).to(device)                  # (B,)
+        # VizDoom get_last_action() returns a binary button vector per step, so the dataset
+        # may be (N, num_buttons). Convert to scalar action indices via argmax.
+        actions_raw = actions_mmap[indices].copy()
+        if actions_raw.ndim == 2:
+            actions_raw = actions_raw.argmax(axis=1)
+        actions_t = torch.tensor(actions_raw, dtype=torch.long).to(device)              # (B,)
+    finally:
+        del obs_mmap, actions_mmap
 
     return TensorDict(
         {"observation": obs_t, "action": actions_t},
@@ -118,7 +121,7 @@ def optimize_model(
     ppo_buffer.clear()
 
     policy_net.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         advantage_module(data)
     policy_net.train()
 
@@ -276,6 +279,9 @@ def train(
                         if cfg.use_wandb:
                             wandb.log({"val_mean_reward": val_mean}, step=training_info.learning_step)
                         policy_net.train()
+                        game_state , info = GameEnv.reset()
+                        state = torch.tensor(game_state['screen'] , dtype = torch.float32).unsqueeze(0).permute(0,3,1,2)
+                        processed_state = base_preprocessor(state,device=device)
 
                     # Checkpoint saving
                     if training_info.learning_step % cfg.saving_interval == 0 and training_info.learning_step > 0:
